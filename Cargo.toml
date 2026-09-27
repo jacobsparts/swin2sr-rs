@@ -1,0 +1,48 @@
+[package]
+name = "swin2sr"
+version = "0.1.0"
+edition = "2021"
+description = "Fast, self-contained Swin2SR image restoration (classical and real-world super-resolution) with CPU and CUDA backends"
+license = "MIT"
+repository = "https://github.com/jacobsparts/swin2sr-rs"
+readme = "README.md"
+
+[[bin]]
+name = "swin2sr"
+path = "src/main.rs"
+
+[features]
+# The default build supports both backends: `--device cpu` is pure Rust,
+# `--device gpu` uses the embedded CUDA fatbins. Building the CUDA feature needs
+# nvcc (set NVCC=/path/to/nvcc if it is not on PATH).
+default = ["cuda"]
+# Compiles cuda/swin2sr.cu with nvcc and embeds the fatbins.
+cuda = []
+# DEVELOPMENT BUILDS ONLY. Adds --raw/--raw-out (run the network on a generated
+# plane of floats instead of an image) and --dump (write every intermediate
+# activation), which are how a divergence is located by STAGE rather than by
+# bisection on the final image. Neither is any use to someone who wants a
+# restored PNG, so a release binary neither accepts them nor lists them.
+#     cargo build --release --features dev
+dev = []
+
+[dependencies]
+png = "0.17"
+# The CPU backend's parallelism. `--device cpu` is the path for a machine with no
+# usable GPU, and one core is ~1/12 of this machine: see the "Parallelism" note at
+# the top of src/cpu.rs for why the split is over output elements rather than over
+# the reduction.
+rayon = "1.12"
+# Driver layer, module/launch/buffer plumbing, the safetensors reader and the
+# generic kernel set.
+lightgpu = { git = "https://github.com/jacobsparts/lightgpu.git" }
+
+[build-dependencies]
+# Compiles this engine's kernel family and the toolkit subset it calls.
+lightgpu-build = { git = "https://github.com/jacobsparts/lightgpu.git", package = "lightgpu-build" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+panic = "abort"
