@@ -175,8 +175,13 @@ with no archive: download what you need and run it.
 | the four `swin2sr-*.safetensors` | the converted checkpoints | 19-82 MiB each; see Choosing a checkpoint |
 
 ```sh
+chmod +x swin2sr-linux-x86_64
 ./swin2sr-linux-x86_64 -m swin2sr-realworld-x4.safetensors -i in.png -o out.png
 ```
+
+The `chmod` is not decoration: a download does not carry the executable
+bit through, and a binary that has lost it fails with `Permission denied`
+before it can print anything.
 
 ## Run
 
