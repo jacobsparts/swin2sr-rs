@@ -54,6 +54,9 @@ convert classical_sr  Swin2SR_ClassicalSR_X4_64.pth                      classic
 convert classical_sr  Swin2SR_ClassicalSR_X2_64.pth                      classical-x2
 convert real_sr       Swin2SR_RealworldSR_X4_64_BSRGAN_PSNR.pth          realworld-x4
 convert lightweight_sr Swin2SR_Lightweight_X2_64.pth                     lightweight-x2
+# The compressed model is x4 and 48-px-registered; its head produces a SECOND
+# output image, which its fixture carries (see `src/fixture.rs`'s FLAG_AUX).
+convert compressed_sr Swin2SR_CompressedSR_X4_48.pth                      compressed-x4
 
 # The fixtures are the accuracy record: a seeded input through the published
 # network, written as the raw f32 planes the engine compares against with
@@ -64,14 +67,20 @@ fixture() {
     task=$2
     scale=$3
     out=$4
+    # The 5th argument is the checkpoint's REGISTERED img_size, and it only has to
+    # be given when it is not 64: it sets the shape of the stored `attn_mask`
+    # buffers, so a mismatch is a hard `load_state_dict` failure. The compressed
+    # checkpoint was registered at 48.
+    patch=${5:-64}
     "$python" tools/make_fixture.py --model "$models/$pth" --task "$task" --scale "$scale" \
-        --h 37 --w 29 --seed 1 --out "tests/data/$out.bin"
+        --patch_size "$patch" --h 37 --w 29 --seed 1 --out "tests/data/$out.bin"
 }
 
 fixture Swin2SR_ClassicalSR_X4_64.pth             classical_sr  4 classical_x4
 fixture Swin2SR_ClassicalSR_X2_64.pth             classical_sr  2 classical_x2
 fixture Swin2SR_RealworldSR_X4_64_BSRGAN_PSNR.pth real_sr       4 realworld_x4
 fixture Swin2SR_Lightweight_X2_64.pth             lightweight_sr 2 lightweight_x2
+fixture Swin2SR_CompressedSR_X4_48.pth            compressed_sr 4 compressed_x4 48
 
 echo
 echo "converted into $models, fixtures in tests/data:"

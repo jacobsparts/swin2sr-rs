@@ -20,8 +20,7 @@ file is self-describing:
     u32 win | u32 flags | u32 reserved | f32 input[h*w*c] | f32 expected[oh*ow*c]
 
 `--dump` also writes every intermediate activation as a `.pt` file, which is how
-a divergence is located by STAGE on the Rust side rather than by bisecting the
-output image (see tools/compare.py).
+a divergence is located by STAGE rather than by bisecting the output image.
 """
 import argparse
 import struct
@@ -48,6 +47,11 @@ CONFIGS = {
 }
 MAGIC = b"SW2F"
 VERSION = 1
+# Header `flags` bit 0: an aux plane follows the expected plane (the compressed_sr
+# head's second output, at the padded plane's size). The field was always in the
+# header and was always written as 0, so setting this bit is what makes the
+# format self-describing without invalidating a single existing fixture.
+FLAG_AUX = 1
 
 
 def load_state(path):
@@ -133,10 +137,18 @@ def main() -> int:
 
     with torch.no_grad():
         y = net(xp)
+    # The compressed_sr head returns (restored, aux). The aux image is at the
+    # PADDED plane's resolution - it is the low-resolution reconstruction the
+    # network emits beside the upsampled one - so it is written as a SECOND plane
+    # with `flags` bit 0 set, and every other head writes exactly the bytes it
+    # always did.
+    aux = None
     if isinstance(y, tuple):
-        y = y[0]
+        y, aux = y[0], y[1]
     oh, ow = h_old * args.scale, w_old * args.scale
     y = y[0, :, :oh, :ow].contiguous()
+    if aux is not None:
+        aux = aux[0].contiguous()
 
     if args.dump:
         torch.save({"in_padded": xp, "in": x, **store}, args.dump)
@@ -146,14 +158,21 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     xi = x[0].contiguous().numpy().astype("<f4")
     yo = y.numpy().astype("<f4")
+    flags = FLAG_AUX if aux is not None else 0
     with out.open("wb") as fh:
         fh.write(MAGIC)
         fh.write(struct.pack("<IIIIIIII", VERSION, args.h, args.w, 3, args.scale,
-                             cfg["window_size"], 0, 0))
+                             cfg["window_size"], flags, 0))
         fh.write(xi.tobytes())
         fh.write(yo.tobytes())
+        if aux is not None:
+            fh.write(aux.numpy().astype("<f4").tobytes())
+    extra = ""
+    if aux is not None:
+        a = aux.numpy()
+        extra = (f", aux {a.shape[2]}x{a.shape[1]} range [{a.min():.4f}, {a.max():.4f}]")
     print(f"{out}: {args.h}x{args.w} -> {oh}x{ow}, {out.stat().st_size} bytes, "
-          f"expected range [{yo.min():.4f}, {yo.max():.4f}]")
+          f"expected range [{yo.min():.4f}, {yo.max():.4f}]{extra}")
     return 0
 
 

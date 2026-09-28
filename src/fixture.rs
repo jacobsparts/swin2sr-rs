@@ -8,6 +8,15 @@ use std::path::Path;
 
 pub const MAGIC: &[u8; 4] = b"SW2F";
 
+/// `flags` bit 0: an aux plane follows `expected`.
+///
+/// The compressed_sr head returns TWO images - the restored one and a
+/// lower-resolution `aux` at the PADDED plane's size - so the fixture has to be
+/// able to carry the second one. A flag rather than a version bump because a
+/// fixture without it is byte-for-byte what it always was, and the field it uses
+/// was already in the header, written as zero and never read.
+pub const FLAG_AUX: u32 = 1;
+
 pub struct Fixture {
     pub version: u32,
     pub h: usize,
@@ -15,8 +24,20 @@ pub struct Fixture {
     pub c: usize,
     pub scale: usize,
     pub win: usize,
+    pub flags: u32,
     pub input: Vec<f32>,
     pub expected: Vec<f32>,
+    /// The head's second output, at the PADDED plane's geometry, for checkpoints
+    /// whose head produces one. `None` for every other head.
+    pub aux: Option<Vec<f32>>,
+}
+
+impl Fixture {
+    /// The padded plane the aux output lives on, `(h/win + 1) * win` per axis -
+    /// the same padding `Plan::new` applies.
+    pub fn aux_plane(&self) -> (usize, usize) {
+        ((self.h / self.win + 1) * self.win, (self.w / self.win + 1) * self.win)
+    }
 }
 
 fn u32le(b: &[u8], off: usize) -> u32 {
@@ -34,20 +55,35 @@ impl Fixture {
         if b.len() < 36 || &b[..4] != MAGIC {
             return Err(format!("{}: not a swin2sr fixture (want 4-byte magic SW2F)", path.display()));
         }
-        let (version, h, w, c, scale, win) =
+        let (version, h, w, c, scale, win, flags) =
             (u32le(&b, 4), u32le(&b, 8) as usize, u32le(&b, 12) as usize, u32le(&b, 16) as usize,
-             u32le(&b, 20) as usize, u32le(&b, 24) as usize);
+             u32le(&b, 20) as usize, u32le(&b, 24) as usize, u32le(&b, 28));
         if version != 1 {
             return Err(format!("{}: fixture version {version}, this engine reads 1", path.display()));
         }
-        let need = 36 + 4 * (h * w * c + h * scale * w * scale * c);
+        if flags & !FLAG_AUX != 0 {
+            return Err(format!(
+                "{}: unknown fixture flags {:#x} - this engine knows only bit 0 ({FLAG_AUX:#x}, \
+                 an aux plane follows)",
+                path.display(),
+                flags
+            ));
+        }
+        let (ah, aw) = if flags & FLAG_AUX != 0 {
+            ((h / win + 1) * win, (w / win + 1) * win)
+        } else {
+            (0, 0)
+        };
+        let need = 36 + 4 * (h * w * c + h * scale * w * scale * c + ah * aw * c);
         if b.len() != need {
             return Err(format!(
-                "{}: {need} bytes expected for {h}x{w}x{c} at scale {scale}, {} present",
+                "{}: {need} bytes expected for {h}x{w}x{c} at scale {scale}{}, {} present",
                 path.display(),
+                if flags & FLAG_AUX != 0 { format!(" with a {ah}x{aw} aux plane") } else { String::new() },
                 b.len()
             ));
         }
+        let aux_at = 36 + 4 * (h * w * c + h * scale * w * scale * c);
         Ok(Fixture {
             version,
             h,
@@ -55,8 +91,10 @@ impl Fixture {
             c,
             scale,
             win,
+            flags,
             input: f32s(&b, 36, h * w * c),
             expected: f32s(&b, 36 + 4 * h * w * c, h * scale * w * scale * c),
+            aux: if flags & FLAG_AUX != 0 { Some(f32s(&b, aux_at, ah * aw * c)) } else { None },
         })
     }
 

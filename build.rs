@@ -28,12 +28,21 @@ const TOOLKIT_KERNELS: &[&str] = &[
     "lg_conv3x3s1p1",
     "lg_conv3x3_winograd",
     // The 1x1 patch_embed convs, at both levels: one thread per output element,
-    // `c_in` FMAs each.
+    // `c_in` FMAs each. `lg_conv1x1_rb` is the register-blocked twin of the same
+    // op - bit-identical output (both fold the bias in first and accumulate c
+    // ascending), grid (ceil(plane/64), ceil(c_out/64), 1) - and is what the
+    // graph launches; `lg_conv1x1` is kept because `--cuda-selftest` compares the
+    // two, which is the only thing that would catch a register-tile indexing bug.
     "lg_conv1x1",
+    "lg_conv1x1_rb",
     // q, k, v and the attention output projection, plus the MLP's two layers:
-    // all four are [tokens][c] x [c][c]. A 16x16 shared-memory tiled matmul; the
-    // per-thread `ss_linear` this replaced was 60% of a forward and 10x slower.
+    // all four are [tokens][c] x [c][c]. `lg_linear` is the 16x16 shared-memory
+    // tiled matmul; `lg_linear_rb` is its register-blocked twin, bit-identical,
+    // 4x4 outputs per thread, grid (ceil(c_out/64), ceil(rows/64), 1), and is
+    // what the graph launches. The per-thread `ss_linear` these replaced was 60%
+    // of a forward and 10x slower than the tiled form.
     "lg_linear",
+    "lg_linear_rb",
     // The real-world head's nearest-neighbour 2x upsample.
     "lg_upsample2x_nearest",
     // `self.norm` at the end of the body: nn.LayerNorm over the channel axis.

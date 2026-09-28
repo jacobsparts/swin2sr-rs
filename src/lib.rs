@@ -19,6 +19,13 @@
 //! not required to be bit-identical to each other, and `--cuda-selftest` exists
 //! only to catch a kernel that does not do what the graph says - it cannot catch a
 //! graph both backends transcribed wrongly, because both would be wrong together.
+//!
+//! `--cuda-selftest` is not a substitute for `tests/gpu.rs` either, and that gap
+//! had teeth: the selftest compares each KERNEL against its CPU twin at shapes the
+//! test chooses, and it passed a fused head kernel whose shared-memory staging had
+//! two threads writing one address - because every shape it uses produces the same
+//! numbers on both sides of the race. What caught it was running the whole GRAPH
+//! on both backends at a width the golden fixtures never reach.
 
 pub mod backend;
 pub mod cpu;

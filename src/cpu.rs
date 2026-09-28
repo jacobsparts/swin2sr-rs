@@ -349,27 +349,53 @@ impl Drop for ScratchOwned {
 // ---------------------------------------------------------------------------
 // The convolution and resampling family.
 //
-// These have CUDA counterparts in `cuda/swin2sr.cu` rather than toolkit
-// counterparts: `lg_conv3x3s1p1`/`lg_conv1x1` exist in the toolkit but have no CPU
-// twins there (its CPU side is the elementwise ops, the norms and the FFT), and
-// this engine needs both backends. They are also the ops with the strongest
-// "consumer" argument in lightgpu's promotion test: the tap order, the padding
-// convention and the channel blocking are all this engine's own.
+// The two dense ops here - the 3x3 and the 1x1 - are LIGHTGPU'S. `lg_conv3x3s1p1`
+// and `lg_conv1x1` began in this file, as the hand-written kernels below, and were
+// promoted into the toolkit so the rest of the family could use them; the copies
+// that used to live here are gone and what is left calls the toolkit's. The 3x3
+// arrives with the 32-column AVX2 register tile, the 1x1 with the register-tiled
+// matmul, and both with the parallel framing - so one implementation of each now
+// serves this engine, the device side's selftest and the rest of the family,
+// instead of three that could drift apart.
+//
+// THE SPEED IS A WASH HERE, and it is worth saying so in the file rather than
+// implying a win. Measured on this box, 64x64 and 128x128 classical-x4 on CPU,
+// interleaved: 0.791/0.802 s and 2.071/2.085 s before and after (medians of five).
+// The twin is the faster kernel where it was measured - 1.17x-3.33x this file's own
+// AVX2 on ifan-rs's shapes - but this engine's time is 42% matmul (`linear`, which
+// the toolkit only has as the scalar reference `linear_rb`) and 32% window
+// attention (no toolkit twin at all), with the 3x3 at 11% and the 1x1 at 1%. A
+// faster kernel cannot move a total that is not mostly that kernel.
+//
+// WHAT IT COSTS is bit-exactness, and only there. The toolkit's 3x3 accumulates in
+// the tiled kernel's order - `ky`, `kx`, `ci`, with zero taps skipped - where the
+// row routine below accumulates `ci`, `ky`, `kx`, so the two differ in the last
+// place of an f32 sum. The fixtures are unmoved at that level (2e-6..5e-6 against a
+// 2e-3 tolerance) but the last bit does move: at 128x128 the final PNG differs from
+// the pre-adoption build on 23 of its 786432 channel values, all by one 8-bit
+// level. That is why `selftest` holds `conv3x3` to the same 1e-5 rounding bound it
+// holds every other op to, rather than to the bit-identity the old copy could
+// claim, and why the head below keeps its own order.
+//
+// The pixel-shuffle HEAD still runs the engine's own order, through `conv_row`:
+// its fused 3x3 keeps one kernel writing straight into the shuffled layout, which
+// is 152 MB of peak allocation and a whole extra pass over the planes, and that
+// fusion does not exist in the toolkit, so it stays here with the order it had.
 // ---------------------------------------------------------------------------
 
 /// 3x3, stride 1, zero padding 1: `out[co][y][x] = b[co] + sum w * in`.
 ///
-/// THE BORDER CARRIES NO BRANCH. Testing `ky`/`kx` against the edges inside the
-/// inner loop costs two comparisons and a bounds check on the 99.7% of pixels that
-/// are interior, and it is why the first version of this ran at 1.6 GFLOP/s on one
-/// core. Instead the row loop takes the taps that exist (`ky0..=ky1`, which is the
-/// same loop with a different start at the top and bottom edges) and the first and
-/// last column of each row are peeled out. The accumulation order per output
-/// element - ci, ky, kx - is UNCHANGED, so the result is bit-identical to the
-/// branchy version, and so to the device kernel, which uses the same order.
+/// This is `lightgpu::ops::cpu::conv3x3s1p1`, which is this file's old kernel after
+/// its promotion into the toolkit: the same tap order the device kernel uses, the
+/// same zero-padding convention, the same split across cores by output row, plus
+/// the 32-column AVX2 register tile with all 27 taps register-resident and the
+/// channel pairing (one task per output-channel pair, four loads feeding eight
+/// FMAs). See the module comment above for why the adoption is not bit-exact.
 ///
-/// Split across cores by (co, y) row: every output element is still accumulated by
-/// one thread in one order, so this is exact rather than merely close.
+/// The wrapper stays because the argument worth keeping is the one `lg` does not
+/// have: the debug asserts below catch a caller passing the wrong plane shape,
+/// which is the mistake this op invites - every call site is a padded plane and
+/// the padding is not derivable from the buffer length.
 #[allow(clippy::too_many_arguments)]
 pub fn conv3x3(
     inp: &[f32],
@@ -384,43 +410,61 @@ pub fn conv3x3(
     debug_assert_eq!(inp.len(), c_in * h * w);
     debug_assert_eq!(out.len(), c_out * h * w);
     debug_assert_eq!(wgt.len(), c_out * c_in * 9);
-    let hw = h * w;
-    let row = |co: usize, y: usize, dest: &mut [f32]| {
-        conv_row(inp, c_in, h, w, &wgt[co * c_in * 9..(co + 1) * c_in * 9], bias[co], y, dest);
-    };
-    if par_on(c_out * hw) {
-        out.par_chunks_mut(w).enumerate().for_each(|(i, dest)| row(i / h, i % h, dest));
-    } else {
-        for (i, dest) in out.chunks_mut(w).enumerate() {
-            row(i / h, i % h, dest);
-        }
-    }
+    lg::conv3x3s1p1(inp, wgt, bias, out, c_in, c_out, h, w);
 }
 
 /// One output ROW of a 3x3, stride 1, zero padding 1 convolution, for one output
-/// channel: `dest[x] = b + sum_ci sum_ky sum_kx wc[ci][ky][kx] * inp[ci][y+ky-1][x+kx-1]`.
+/// channel: `dest[x] += sum_ky sum_kx sum_ci wc[ci][ky][kx] * inp[ci][y+ky-1][x+kx-1]`.
 ///
-/// Factored out of [`conv3x3`] so the head can reuse it verbatim. The accumulation
-/// order - `ci`, then `ky`, then `kx` - is the order the device kernel uses and the
-/// order the reference's summation happens to reduce to, and it is why a row built
-/// here is bit-identical to the same row built by the plain loop.
+/// This is the head's, and it is now its ONLY caller: the fused pixel-shuffle
+/// stage, which has no toolkit counterpart. `dest` is accumulated into rather than
+/// overwritten, because that stage runs this twice into two different buffers and
+/// then interleaves them.
+///
+/// THE ORDER IS THE TAP ORDER, `ky` then `kx` then `ci`, which is the toolkit's and
+/// the device kernel's - and not the `ci`, `ky`, `kx` this file used to have. That
+/// distinction matters because `selftest` used to compare this row's output with
+/// `conv3x3`'s bit for bit, and `conv3x3` is now the toolkit's, so the comparison
+/// is at a rounding tolerance instead. Keeping the taps adjacent also lets a row
+/// load a pixel once and use it for all three of its `kx` taps, which is what
+/// [`row_accumulate`] does.
 #[inline]
 fn conv_row(inp: &[f32], c_in: usize, h: usize, w: usize, wc: &[f32], b: f32, y: usize,
             dest: &mut [f32]) {
-    let hw = h * w;
     dest.fill(b);
     // The rows this output row reads: the one above is missing at the top edge
     // and the one below at the bottom, and nothing else changes.
     let ky0 = if y == 0 { 1 } else { 0 };
     let ky1 = if y + 1 == h { 1 } else { 2 };
+    row_accumulate(inp, wc, c_in, h * w, y, w, ky0, ky1, dest);
+}
+
+/// The scalar half of [`conv_row`]: one output row, over a RANGE of input rows.
+///
+/// `ky0..=ky1` is the skip-the-missing-edge-rows trick, and it works because the
+/// row this reads for tap `ky` is `y + ky - 1`: at the top edge `ky = 0` would read
+/// row -1 and is left out of the range, at the bottom `ky = 2` would read row `h`.
+/// With the taps adjacent, a `ky` pass reads one input row and writes all three of
+/// that row's contributions, so the row is loaded once per output element instead
+/// of three times.
+///
+/// The border carries no branch either: the first and last column of each input
+/// row are peeled out inside the `ky` pass below, and the interior loop has none.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn row_accumulate(
+    inp: &[f32], wc: &[f32], c_in: usize, hw: usize, y: usize, w: usize,
+    ky0: usize, ky1: usize, dest: &mut [f32],
+) {
     for ci in 0..c_in {
         let ic = &inp[ci * hw..ci * hw + hw];
         let k = &wc[ci * 9..ci * 9 + 9];
         for ky in ky0..=ky1 {
             let srow = &ic[(y + ky - 1) * w..(y + ky) * w];
             let krow = &k[ky * 3..ky * 3 + 3];
+            // `w == 1` is its own case: only the centre tap is in the plane, and
+            // the general form below would read `srow[saturating_sub(1)]`.
             if w == 1 {
-                // One column: only the centre tap is in the plane at all.
                 dest[0] += krow[1] * srow[0];
                 continue;
             }
@@ -500,17 +544,18 @@ pub fn conv3x3_shuffle2(
 /// 1x1, stride 1 - a matmul over positions. `inp` is `[c_in][hw]`, `out` is
 /// `[c_out][hw]`, so both are channel-major and the positions are the "rows".
 ///
-/// `tmp` is scratch of at least `c_out * hw` floats. It is needed because the
-/// parallel split and the output layout disagree: the fast inner loop wants the
-/// destination blocked by rows ([`matmul_rows`]), while NCHW is blocked by
-/// channels - so the matmul lands in `tmp` row-major and one transpose puts it in
-/// `out`. The transpose is a tenth of the cost of the matmul and buys the whole
-/// machine instead of a sixth of it: a channel-major destination can only be split
-/// by channel block, which is six tasks for `c_out = 180`.
+/// This is `lightgpu::ops::cpu::conv1x1`, which is this file's old implementation
+/// after its promotion into the toolkit - the same register-tiled matmul, folding
+/// the bias into the accumulator exactly as the old one did, and now the same
+/// toolkit entry point the device side's twin uses.
 ///
-/// The obvious version of this - one output channel at a time, sweeping the whole
-/// plane per channel - is what the first draft did, and it measured 1.4 GFLOP/s
-/// because it streams the entire input plane from memory once per output channel.
+/// TWO ARGUMENTS ARE GONE with it. `tmp` and `wpack` were this op's scratch: the
+/// row-major destination is written by the toolkit's own internal split, so no
+/// `c_out * hw` staging buffer and no transposed weight pack are needed here. They
+/// stay in the signature - `Scratch` still owns them, they are still reported in
+/// the run's memory line, and `gpu.rs` still passes its own - but they are unused,
+/// which the `let _` below says out loud rather than leaving the reader to wonder
+/// whether the call forgot them.
 #[allow(clippy::too_many_arguments)]
 pub fn conv1x1(
     inp: &[f32],
@@ -527,10 +572,8 @@ pub fn conv1x1(
     debug_assert_eq!(out.len(), c_out * hw);
     debug_assert_eq!(wgt.len(), c_out * c_in);
     debug_assert!(tmp.len() >= c_out * hw);
-    let tmp = &mut tmp[..c_out * hw];
-    pack_weight(wgt, c_in, c_out, wpack);
-    matmul_rows(inp, hw, c_in, &wpack[..c_in * c_out], c_out, bias, tmp);
-    transpose(tmp, out, hw, c_out);
+    let _ = (tmp, wpack);
+    lg::conv1x1(inp, wgt, bias, out, c_in, c_out, 1, hw);
 }
 
 /// `wpack[ci][co] = wgt[co][ci]`: the weight `[c_out][c_in]` in the layout the
@@ -801,6 +844,92 @@ pub fn pixel_shuffle(inp: &[f32], c: usize, h: usize, w: usize, scale: usize, ou
     } else {
         for (r, dst) in out.chunks_mut(ow).enumerate() {
             row(r, dst);
+        }
+    }
+}
+
+/// `F.interpolate(x, size=(oh, ow), mode='bicubic', align_corners=False)`, which
+/// the compressed_sr head applies to the INPUT plane before the body runs.
+///
+/// This is not an integer upsample and cannot be one: the source is the PADDED
+/// plane and so is the TARGET - 37x29 arrives as 40x32 and becomes 160x128 - so
+/// the ratios are 4 and 4 after all, but only because the padding is applied on
+/// both sides. (The reference's own `size=(H*scale, W*scale)` uses the dims of the
+/// plane it was HANDED, which is the padded one; see the head.) It is a general
+/// resample, and it has to be torch's resample to the last bit, because its output
+/// is added to the body's before `conv_last` and a different kernel is a different
+/// image.
+///
+/// torch's scheme, confirmed numerically against it (`upsample_bicubic2d`):
+/// the source position of output index `i` is `(i + 0.5) * (in / out) - 0.5`;
+/// the four taps are `floor(src) - 1 .. floor(src) + 2`, each weighted by the
+/// cubic convolution kernel with `a = -0.75`
+///
+/// ```text
+/// w(t) = ((a + 2)t - (a + 3))t^2 + 1        for |t| <= 1
+/// w(t) = (((t - 5)t + 8)t - 4) * a          for 1 < |t| < 2
+/// ```
+///
+/// and a tap outside the plane is CLAMPED to the edge sample (torch's border
+/// handling; it is not reflection). The two axes are separable, so the weights
+/// are computed once per output row and once per output column rather than per
+/// output texel.
+pub fn bicubic_resize(inp: &[f32], c: usize, h: usize, w: usize, oh: usize, ow: usize,
+                     out: &mut [f32]) {
+    debug_assert_eq!(inp.len(), c * h * w);
+    debug_assert_eq!(out.len(), c * oh * ow);
+    #[inline]
+    fn kernel(t: f32) -> f32 {
+        const A: f32 = -0.75;
+        let t = t.abs();
+        if t <= 1.0 {
+            ((A + 2.0) * t - (A + 3.0)) * t * t + 1.0
+        } else if t < 2.0 {
+            (((t - 5.0) * t + 8.0) * t - 4.0) * A
+        } else {
+            0.0
+        }
+    }
+    // The taps are precomputed per output index on each axis: `(index, weight)`
+    // pairs into the source, with the index already clamped to the plane.
+    let taps = |n_in: usize, n_out: usize| -> Vec<[(usize, f32); 4]> {
+        (0..n_out)
+            .map(|i| {
+                let src = (i as f32 + 0.5) * (n_in as f32 / n_out as f32) - 0.5;
+                let base = src.floor();
+                let mut t = [(0usize, 0.0f32); 4];
+                for (m, slot) in t.iter_mut().enumerate() {
+                    let idx = base as isize - 1 + m as isize;
+                    slot.0 = idx.clamp(0, n_in as isize - 1) as usize;
+                    slot.1 = kernel(src - (base + m as f32 - 1.0));
+                }
+                t
+            })
+            .collect()
+    };
+    let (ty, tx) = (taps(h, oh), taps(w, ow));
+    // One output ROW per task, as `upsample2x_nearest` does per row-pair.
+    let row = |ch: usize, y: usize, dst: &mut [f32]| {
+        let src = &inp[ch * h * w..][..h * w];
+        let (t0, t1, t2, t3) = (ty[y][0], ty[y][1], ty[y][2], ty[y][3]);
+        for (x, d) in dst.iter_mut().enumerate() {
+            let (u0, u1, u2, u3) = (tx[x][0], tx[x][1], tx[x][2], tx[x][3]);
+            let mut acc = 0.0f32;
+            for (ry, wy) in [t0, t1, t2, t3] {
+                let r = &src[ry * w..][..w];
+                let pair = |(cx, wx): (usize, f32)| wx * r[cx];
+                let (a0, a1, a2, a3) = (pair(u0), pair(u1), pair(u2), pair(u3));
+                acc += wy * ((a0 + a1) + (a2 + a3));
+            }
+            *d = acc;
+        }
+    };
+    if par_on(out.len()) {
+        out.par_chunks_mut(ow).enumerate().for_each(|(i, dst)| row(i / oh, i % oh, dst));
+    } else {
+        for i in 0..c * oh {
+            let dst = &mut out[i * ow..(i + 1) * ow];
+            row(i / oh, i % oh, dst);
         }
     }
 }
@@ -1300,16 +1429,18 @@ fn rss_mark(tag: &str) {
 /// reference's too), so nothing above it has to know about windows.
 ///
 /// `input` is [3][h][w] in [0,1]; the result is [3][h*scale][w*scale], denormalised
-/// and cropped. `dump` receives every activation in the `torch` module order named
-/// by `tools/make_fixture.py --dump`, which is how a divergence is located by
-/// stage rather than by bisection on the final image.
+/// and cropped. `dump` receives every activation in the `torch` module order the
+/// reference names them in, which is how a divergence is located by stage rather
+/// than by bisection on the final image.
+/// The whole-image forward pass. Returns the restored image, and - for a head
+/// that produces one - the secondary `aux` image, already through its epilogue.
 pub fn forward(
     wt: &Weights,
     plan: &Plan,
     input: &[f32],
     stock: &mut ScratchOwned,
     mut dump: Option<Dump>,
-) -> Result<Vec<f32>, String> {
+) -> Result<(Vec<f32>, Option<Vec<f32>>), String> {
     // The scratch is owned by the caller so the reusable one survives the call:
     // see `ScratchOwned`. The body itself reaches everywhere through `scr.buf`.
     let scr = &mut *stock.buf;
@@ -1504,7 +1635,42 @@ pub fn forward(
     };
     // The head hands the scratch back, and the caller stores it: that is what lets
     // the next forward - or the next tile - start from these blocks.
-    let (mut stock2, planes) = head(wt, plan, owned, dump)?;
+    // The compressed head's OTHER input: the bicubic resample of the padded plane,
+    // resized to the output grid and convolved to `feat` channels. It is computed
+    // HERE because `padded` lives here - the reference computes the branch before
+    // the body and adds it to the head's octaves at the end - and handed to the
+    // head, which is the only other place it is needed.
+    let bicubic = match wt.upsampler {
+        Upsampler::PixelShuffleAux => {
+            let feat = wt.t("conv_bicubic.weight").len() / (3 * 9);
+            // The PADDED output grid, not the original one. The reference's `H, W`
+            // are the dims of the image it was HANDED - and the task wrapper hands
+            // it the padded plane - so its `F.interpolate(x, size=(H*scale, W*scale))`
+            // runs on the padded geometry and its own `[:H*scale, :W*scale]` crop is
+            // a no-op. Resizing to the original size instead shifts every tap.
+            let (oh, ow) = (plan.hp * wt.scale, plan.wp * wt.scale);
+            let mut resized = vec![0.0f32; 3 * oh * ow];
+            bicubic_resize(&padded, 3, plan.hp, plan.wp, oh, ow, &mut resized);
+            if let Some(f) = dump.as_deref_mut() {
+                f("bicubic_resize", &resized, 3);
+            }
+            let mut b = vec![0.0f32; feat * oh * ow];
+            conv3x3(&resized, 3, oh, ow, wt.t("conv_bicubic.weight"), feat,
+                    wt.t("conv_bicubic.bias"), &mut b);
+            if let Some(f) = dump.as_deref_mut() {
+                f("conv_bicubic", &b, feat);
+            }
+            rss_mark("after conv_bicubic");
+            Some(b)
+        }
+        _ => None,
+    };
+    if bicubic.is_some() {
+        // `padded` is a plane and the body's blocks are the ones the head is about
+        // to need; the bicubic branch has already copied everything it reads.
+        drop(padded);
+    }
+    let (mut stock2, planes, aux) = head(wt, plan, owned, bicubic.as_deref(), dump)?;
     // Every field `forward` took out is emptied, and the blocks that were in them
     // went to the pool (some by hand, some by `free_body`). Put the invariant back
     // before the handle is stored, or the next forward of the SAME size reads
@@ -1512,9 +1678,10 @@ pub fn forward(
     stock2.refill(plan, wt.mlp_ratio);
     *stock = stock2;
     rss_mark("before finish");
-    let out = finish(wt, plan, &planes);
+    let out = finish(wt, plan, &planes, plan.wp * wt.scale);
+    let aux_out = aux.map(|a| finish_aux(wt, plan, &a));
     rss_mark("after finish");
-    Ok(out)
+    Ok((out, aux_out))
 }
 
 /// The reconstruction head: `planes` is [3][hp*scale][wp*scale], still denormalised.
@@ -1526,8 +1693,14 @@ pub fn forward(
 /// of them alive across the call (`Scratch` is borrowed, so a callee cannot free
 /// its fields), which is worth several padded planes of peak RSS for no other
 /// reason than where the line between the two functions was drawn.
-fn head(wt: &Weights, plan: &Plan, mut owned: ScratchOwned, mut dump: Option<Dump>)
-    -> Result<(ScratchOwned, Vec<f32>), String> {
+/// The head. `bicubic` carries the compressed head's pre-upsample branch - the
+/// bicubic-resized input, already convolved to `feat` channels on the OUTPUT grid
+/// - which `forward` computes because it is the only place the padded input plane
+/// is in scope. It is `Some` for `PixelShuffleAux` and `None` for every other
+/// head, and the same is true of the returned aux plane.
+fn head(wt: &Weights, plan: &Plan, mut owned: ScratchOwned, bicubic: Option<&[f32]>,
+        mut dump: Option<Dump>)
+    -> Result<(ScratchOwned, Vec<f32>, Option<Vec<f32>>), String> {
     // `scr` reaches the buffers; `owned` is what goes back to the caller. The
     // borrow has to end before the return, hence the scope.
     let scr = &mut *owned.buf;
@@ -1540,6 +1713,11 @@ fn head(wt: &Weights, plan: &Plan, mut owned: ScratchOwned, mut dump: Option<Dum
     // direct one - so it is read per branch, not here. Reading it here panicked on
     // the lightweight checkpoint, which no earlier fixture reached.
     let mut planes;
+    // The compressed head returns a SECOND image: the low-resolution reconstruction
+    // it emits beside the upsampled one, at the padded plane's geometry. Every
+    // other head leaves this `None`, which is what the fixture's `flags` bit 0 and
+    // the backends' aux accessor both key off.
+    let mut aux_out: Option<Vec<f32>> = None;
     match wt.upsampler {
         Upsampler::PixelShuffle => {
             let feat = wt.t("conv_before_upsample.0.weight").len() / (c * 9);
@@ -1621,14 +1799,76 @@ fn head(wt: &Weights, plan: &Plan, mut owned: ScratchOwned, mut dump: Option<Dum
             planes = vec![0.0f32; 3 * h2 * w2];
             conv3x3(&hr, feat, h2, w2, wt.t("conv_last.weight"), 3, wt.t("conv_last.bias"), &mut planes);
         }
+        // The compressed head: the classical head with a bicubic shortcut around it
+        // and a second output. `conv_before_upsample` feeds TWO branches - the
+        // pixel-shuffle octaves that reconstruct the high-resolution image, and a
+        // three-channel `conv_aux` that IS the low-resolution image the model also
+        // returns - and the bicubic pre-upsample is added to the octaves' before
+        // `conv_last`.
+        //
+        // Note the slopes: `conv_before_upsample` and `conv_after_aux` are
+        // `nn.LeakyReLU(inplace=True)` with NO explicit slope, so they are 0.01, the
+        // frame's default - not the 0.2 the real-world head's convs use. Reading 0.2
+        // off the neighbouring arm is the easy mistake here.
         Upsampler::PixelShuffleAux => {
-            return Err(
-                "the compressed_sr head (pixelshuffle_aux) is not implemented: it needs the \
-                 bicubic pre-upsample branch and a second output image, and the checkpoint this \
-                 engine was verified against is the classical one. Convert a classical_sr, \
-                 real_sr or lightweight_sr checkpoint instead."
-                    .into(),
-            );
+            let feat = wt.t("conv_before_upsample.0.weight").len() / (c * 9);
+            let mut a = vec![0.0f32; feat * hw];
+            conv3x3(&scr.cur, c, plan.hp, plan.wp, wt.t("conv_before_upsample.0.weight"), feat,
+                    wt.t("conv_before_upsample.0.bias"), &mut a);
+            leaky_relu(&mut a, 0.01);
+            if let Some(f) = dump.as_deref_mut() {
+                f("conv_before_upsample", &a, feat);
+            }
+            // The aux image comes off the PADDED plane, before any octave - it is
+            // 3 channels at `hp x wp`, and the epilogue scales it like the main
+            // output. Nothing else in the head reads it.
+            let mut aux = vec![0.0f32; 3 * hw];
+            conv3x3(&a[..feat * hw], feat, plan.hp, plan.wp, wt.t("conv_aux.weight"), 3,
+                    wt.t("conv_aux.bias"), &mut aux);
+            if let Some(f) = dump.as_deref_mut() {
+                f("conv_aux", &aux, 3);
+            }
+            let mut x = vec![0.0f32; feat * hw];
+            conv3x3(&aux, 3, plan.hp, plan.wp, wt.t("conv_after_aux.0.weight"), feat,
+                    wt.t("conv_after_aux.0.bias"), &mut x);
+            leaky_relu(&mut x, 0.01);
+            // `cur` is dead now: everything the head needs is in `x` and `aux`.
+            scr.free_body();
+            rss_mark("compressed head: after conv_after_aux");
+            let (mut h2, mut w2) = (plan.hp, plan.wp);
+            for o in 0..wt.upsampler.octaves(scale) {
+                let (uw, ub) = (format!("upsample.{}.weight", 2 * o), format!("upsample.{}.bias", 2 * o));
+                let mut shuf = vec![0.0f32; feat * 4 * h2 * w2];
+                conv3x3_shuffle2(&x[..feat * h2 * w2], feat, h2, w2, wt.t(&uw), feat, wt.t(&ub),
+                                 &mut shuf);
+                x = shuf;
+                h2 *= 2;
+                w2 *= 2;
+                rss_mark(&format!("compressed head: after octave {o} ({h2}x{w2})"));
+            }
+            // `x = self.upsample(x)[:, :, :H*scale, :W*scale] + bicubic[:, :, :H*scale, :W*scale]`
+            // - over the whole plane, because the reference's `H, W` are the dims of
+            // the image it was HANDED and the task wrapper hands it the PADDED one.
+            // So its slice is a no-op here and everything stays on the padded output
+            // grid, which is also why `conv_last` runs at that size and the crop to
+            // the original resolution happens once, in `finish`, like every other
+            // head. Cropping inside the head is the mistake this code was written
+            // with first: it made `planes` a different size from every other head's
+            // and put the error at the plane's edge.
+            let bic = bicubic.expect("PixelShuffleAux needs the bicubic branch (see forward)");
+            let mut summed = vec![0.0f32; feat * h2 * w2];
+            for ch in 0..feat {
+                for y in 0..h2 {
+                    for bx in 0..w2 {
+                        summed[(ch * h2 + y) * w2 + bx] =
+                            x[(ch * h2 + y) * w2 + bx] + bic[(ch * h2 + y) * w2 + bx];
+                    }
+                }
+            }
+            planes = vec![0.0f32; 3 * h2 * w2];
+            conv3x3(&summed, feat, h2, w2, wt.t("conv_last.weight"), 3, wt.t("conv_last.bias"),
+                    &mut planes);
+            aux_out = Some(aux);
         }
     }
     // The head's own buffers go back to the pool on drop, but the scratch itself -
@@ -1636,20 +1876,57 @@ fn head(wt: &Weights, plan: &Plan, mut owned: ScratchOwned, mut dump: Option<Dum
     // to be behind us. Naming it here is what ends the borrow.
     let _ = &mut owned.buf;
     rss_mark("head done");
-    Ok((owned, planes))
+    Ok((owned, planes, aux_out))
+}
+
+/// The aux image's epilogue: the same `x / img_range + mean`, and NO CROP.
+///
+/// The compressed head's second output is emitted on the padded plane and the
+/// reference returns it that way - the crop to the original size is applied to
+/// the upsampled output only. Cropping this one too would look like tidying and
+/// would make the image the wrong size.
+///
+/// PUBLIC for the same reason `finish` is: the device backend downloads the aux
+/// activations and runs this host arithmetic on them, so there is one copy of the
+/// epilogue rather than one per backend.
+pub fn finish_aux(wt: &Weights, plan: &Plan, aux: &[f32]) -> Vec<f32> {
+    let hw = plan.plane();
+    let mut out = vec![0.0f32; 3 * hw];
+    for ci in 0..3 {
+        let src = &aux[ci * hw..(ci + 1) * hw];
+        let dst = &mut out[ci * hw..(ci + 1) * hw];
+        for (d, v) in dst.iter_mut().zip(src) {
+            *d = v / wt.img_range + wt.mean[ci];
+        }
+    }
+    out
 }
 
 /// `x / img_range + mean`, then the crop to the original size - which the
 /// reference does with a nearest-neighbour-named slice after having upsampled the
 /// PADDED plane, so the padded margin is computed and then thrown away.
 ///
+/// The crop is written as "take the first `h*scale` rows and `w*scale` columns of
+/// whatever plane is here", never as "the plane is `hp*scale` wide": the two heads
+/// hand this function DIFFERENT geometries. The classical head's octaves and
+/// `conv_last` run on the padded grid, so the crop is real; the compressed head
+/// crops INSIDE the head (the reference's slice is applied before `conv_last`),
+/// so its plane is already `h*scale` by `w*scale` and this crop takes everything.
+/// Reading the geometry off an assumed padded width is what made this panic.
+///
+/// `src_w` is the plane's own width, which is the STRIDE its rows are stored
+/// with: every head today produces the padded output grid (`plan.wp * scale`),
+/// and passing it explicitly is what keeps that a stated fact rather than a
+/// coincidence a future head can break silently.
+///
 /// PUBLIC so the device backend can call it: the epilogue is host arithmetic
 /// either way, and a second copy of it would be a second place for the crop to
 /// disagree with the padding above it.
-pub fn finish(wt: &Weights, plan: &Plan, planes: &[f32]) -> Vec<f32> {
+pub fn finish(wt: &Weights, plan: &Plan, planes: &[f32], src_w: usize) -> Vec<f32> {
     let scale = wt.scale;
-    let (oh, ow) = (plan.hp * scale, plan.wp * scale);
     let (h, w) = (plan.h * scale, plan.w * scale);
+    let (oh, ow) = (planes.len() / 3 / src_w, src_w);
+    assert!(ow >= w && oh >= h, "finish: a {ow}x{oh} plane cannot contain a {w}x{h} output");
     let mut out = vec![0.0f32; 3 * h * w];
     for ci in 0..3 {
         let plane = &planes[ci * oh * ow..(ci + 1) * oh * ow];
@@ -1662,6 +1939,8 @@ pub fn finish(wt: &Weights, plan: &Plan, planes: &[f32]) -> Vec<f32> {
     }
     out
 }
+
+
 
 
 // ---------------------------------------------------------------------------
@@ -1678,6 +1957,10 @@ pub struct Cpu<'a> {
     c: usize,
     scratch: Option<ScratchOwned>,
     plan: Option<Plan>,
+    /// The last forward's secondary image, for a head that produces one. Kept on
+    /// the handle rather than threaded through `Backend::forward`, whose
+    /// single-plane return every existing caller depends on.
+    aux: Option<Vec<f32>>,
 }
 
 impl<'a> Cpu<'a> {
@@ -1689,6 +1972,7 @@ impl<'a> Cpu<'a> {
             c: wt.embed,
             scratch: None,
             plan: None,
+            aux: None,
         })
     }
 }
@@ -1717,9 +2001,14 @@ impl crate::backend::Backend for Cpu<'_> {
             }
         };
         let scr = self.scratch.as_mut().expect("scratch is built with the plan");
-        forward(self.wt, &plan, input, scr, None)
+        let (planes, aux) = forward(self.wt, &plan, input, scr, None)?;
+        self.aux = aux;
+        Ok(planes)
     }
 
+    fn aux(&self) -> Option<&[f32]> {
+        self.aux.as_deref()
+    }
 }
 
 /// The library's internal checks, for `--self-test` and `tests/parity.rs`.
@@ -1772,10 +2061,19 @@ pub fn selftest() -> Result<(), String> {
         checks += 1;
     }
 
-    // The head's fused conv against the two ops it replaces, BIT FOR BIT: the same
-    // rows in the same order, written to permuted addresses. Anything but exact
-    // equality means the interleave is wrong, and an interleave is exactly the kind
-    // of mistake that produces a plausible image rather than a crash.
+    // The head's fused conv against the two ops it replaces: the same rows, written
+    // to permuted addresses, so an error here is an interleave error - and an
+    // interleave is exactly the kind of mistake that produces a plausible image
+    // rather than a crash.
+    //
+    // THIS USED TO BE BIT FOR BIT, and it cannot be any more. The fused path keeps
+    // the engine's row routine, `ky`, `kx`, `ci`; `conv3x3` is the toolkit's now,
+    // whose tiled inner loop is `ci`, `ky`, `kx` with the zero taps skipped. Two
+    // different orderings of the same 135-term sum differ in the last place of an
+    // f32, which is what the 1e-5 below is - the same bound every other op in this
+    // function is held to, and three orders inside the fixtures'. What it still
+    // catches is every way of getting the permutation wrong, which is what the
+    // check is for.
     {
         let (ci, feat, h, w) = (5usize, 3usize, 4usize, 6usize);
         let x: Vec<f32> = (0..ci * h * w).map(|_| next()).collect();
@@ -1788,9 +2086,10 @@ pub fn selftest() -> Result<(), String> {
         let mut got = vec![0.0f32; feat * 4 * h * w];
         conv3x3_shuffle2(&x, ci, h, w, &wgt, feat, &bias, &mut got);
         for i in 0..got.len() {
-            if got[i] != want[i] {
+            let d = (got[i] - want[i]).abs();
+            if d > 1e-5 {
                 return Err(format!(
-                    "conv3x3_shuffle2 differs from conv3x3 + pixel_shuffle2 at {i}: {} vs {}",
+                    "conv3x3_shuffle2 differs from conv3x3 + pixel_shuffle2 at {i}: {} vs {} ({d})",
                     got[i], want[i]
                 ));
             }

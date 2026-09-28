@@ -188,13 +188,37 @@ extern "C" __global__ void ss_attention(
     // One row of `kns` per head: the block spans every head, so the norms cannot
     // be shared across it.
     __shared__ float kns[SS_MAX_HEADS][SS_MAX_N];
-    for (int k = threadIdx.x; k < n; k += blockDim.x) {
-        for (int h = 0; h < heads; ++h) {
-            const float *krow = K + ((size_t)wi * n + k) * c + h * head_dim;
-            float kn = 0.f;
-            for (int d = 0; d < head_dim; ++d) kn += krow[d] * krow[d];
-            kn = sqrtf(kn);
-            kns[h][k] = kn < 1e-12f ? 1e-12f : kn;
+    // THE MASK BAND, computed once per token instead of once per (query, key, head).
+    // `ss_region` is two comparisons but the divides that feed it (`i / win`,
+    // `i % win`, `wi / nww`, `wi % nww`) are not free, and the old loop called it
+    // four times per (query, key) pair - 2.4M divisions per launch on a kernel whose
+    // arithmetic is a rounding error next to its own latency. A token's band is a
+    // property of the token, so ONE table serves both roles: `kry[i]`/`krx[i]` are
+    // read as the key's band and as the query's band.
+    __shared__ signed char kry[SS_MAX_N], krx[SS_MAX_N];
+    // THE BIAS TABLE IS PRE-TRANSPOSED BY THE HOST, to [head][query][key]. It cannot
+    // be staged here: `cpb` is [query][key][head] and the transposed form is
+    // heads*n*n floats, 196 KB at this model's shape against a 48 KB static limit.
+    // The host does it once per upload instead (`gpu::transpose_cpb`), which is the
+    // same re-indexing `cpu::attention` documents: the old read of
+    // `cpb[(q * n + k) * heads + h]` walks with a stride of `heads` floats, so a
+    // warp - 32 consecutive queries of one head - touches 32 cache lines per key and
+    // covers the whole 98 KB table once per key row; transposed, one head's 16 KB
+    // plane is contiguous and stays in L1 for the whole query loop. Same numbers,
+    // same order, same accumulation: bit-identical.
+    for (int i = threadIdx.x + threadIdx.y * blockDim.x; i < n * heads;
+         i += blockDim.x * blockDim.y) {
+        const int k = i % n, h = i / n;
+        const float *krow = K + ((size_t)wi * n + k) * c + h * head_dim;
+        float kn = 0.f;
+        for (int d = 0; d < head_dim; ++d) kn += krow[d] * krow[d];
+        kn = sqrtf(kn);
+        kns[h][k] = kn < 1e-12f ? 1e-12f : kn;
+    }
+    if (masked) {
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            kry[i] = (signed char)ss_region((wi / nww) * win + i / win, hp, win, shift);
+            krx[i] = (signed char)ss_region((wi % nww) * win + i % win, wp, win, shift);
         }
     }
     __syncthreads();
@@ -224,8 +248,8 @@ extern "C" __global__ void ss_attention(
         }
         qn = sqrtf(qn);
         if (qn < 1e-12f) qn = 1e-12f;
-        const int rqy = masked ? ss_region((wi / nww) * win + q / win, hp, win, shift) : 0;
-        const int rqx = masked ? ss_region((wi % nww) * win + q % win, wp, win, shift) : 0;
+        const int rqy = masked ? kry[q] : 0;
+        const int rqx = masked ? krx[q] : 0;
 
         float logits[SS_MAX_N];
         float mx = -INFINITY;
@@ -243,12 +267,8 @@ extern "C" __global__ void ss_attention(
             }
             for (; d < head_dim; ++d) a0 += qr[d] * krow[d];
             const float dot = ((a0 + a1) + (a2 + a3)) / kns[h][k];
-            float s = dot * (ls / qn) + cpb[(q * n + k) * heads + h];
-            if (masked) {
-                const int rky = ss_region((wi / nww) * win + k / win, hp, win, shift);
-                const int rkx = ss_region((wi % nww) * win + k % win, wp, win, shift);
-                if (rqy != rky || rqx != rkx) s -= 100.f;
-            }
+            float s = dot * (ls / qn) + cpb[((size_t)h * n + q) * n + k];
+            if (masked && (rqy != kry[k] || rqx != krx[k])) s -= 100.f;
             logits[k] = s;
             mx = fmaxf(mx, s);
         }
@@ -263,22 +283,35 @@ extern "C" __global__ void ss_attention(
             sum += logits[k];
         }
         const float inv_sum = 1.f / sum;
-        // THE WEIGHTED SUM IS KEY-OUTER, DIM-INNER. The other order - one output
-        // dimension at a time, sweeping the keys - reads `V[k][d]` with a stride of
-        // `c` floats, so a thread touches 64 cache lines for every one of its 30
-        // dimensions and the whole 46 KB head block has to stay resident to avoid
-        // re-fetching it. This way each key's 30 floats are ONE contiguous run, read
-        // once, and the accumulator is 30 registers' worth of local memory that
-        // stays in L1.
-        float oacc[SS_MAX_HD];
-        for (int d = 0; d < head_dim; ++d) oacc[d] = 0.f;
-        for (int k = 0; k < n; ++k) {
-            const float w = logits[k] * inv_sum;
-            const float *vrow = V + ((size_t)wi * n + k) * c + off;
-            for (int d = 0; d < head_dim; ++d) oacc[d] += w * vrow[d];
-        }
+        // THE WEIGHTED SUM IS DIM-OUTER, KEY-INNER, AND THAT ORDER IS MEASURED, NOT
+        // PREFERRED. This used to be key-outer with one serial accumulator per output
+        // dimension: a 64-long dependent FMA chain per `d`, whose operand loads are
+        // 720 bytes apart, for every one of 30 dimensions. An experiment that skipped
+        // the pass entirely put ss_attention at 2469 ms against 5822 ms - so 3353 ms,
+        // 58% of the kernel, was this loop and not the dot products or the softmax
+        // (replacing `expf` with a subtract changed nothing).
+        //
+        // The CPU twin has always done it this way: `cpu::attention` sweeps `d` outer
+        // and `k` inner in groups of FOUR, with a tail, and reduces
+        // `((a0+a1)+(a2+a3)) + tail`. Doing the same here is therefore not a
+        // tolerance-eating change - it makes the device's summation order IDENTICAL
+        // to the reference the selftest compares it against, where before it was
+        // merely close. `w` is the same weight, the products are the same, and the
+        // single multiply by `1/sum` still happens once per element at the end.
         float *orow = out + ((size_t)wi * n + q) * c + off;
-        for (int d = 0; d < head_dim; ++d) orow[d] = oacc[d];
+        for (int d = 0; d < head_dim; ++d) {
+            float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+            int k = 0;
+            for (; k + 4 <= n; k += 4) {
+                a0 += logits[k] * V[((size_t)wi * n + k) * c + off + d];
+                a1 += logits[k + 1] * V[((size_t)wi * n + k + 1) * c + off + d];
+                a2 += logits[k + 2] * V[((size_t)wi * n + k + 2) * c + off + d];
+                a3 += logits[k + 3] * V[((size_t)wi * n + k + 3) * c + off + d];
+            }
+            float tail = 0.f;
+            for (; k < n; ++k) tail += logits[k] * V[((size_t)wi * n + k) * c + off + d];
+            orow[d] = ((a0 + a1) + (a2 + a3) + tail) * inv_sum;
+        }
     }
 }
 
@@ -333,32 +366,24 @@ extern "C" __global__ void ss_pixel_shuffle2(
 // and the odd column of an output row from one thread, which is why `blockDim.x`
 // is `wd` (one thread per INPUT column) and each thread produces two outputs.
 //
-// THE THREE SOURCE ROWS ARE STAGED IN TWO SHARED SLOTS. Output row `y` of the conv
-// reads input rows `y - 1`, `y` and `y + 1`, and row `h` does not exist - the plan's
-// padded height is already a window multiple, so the conv's own border rule (skip
-// the taps that fall outside) is the only rule that applies; there is no extra
-// padding row to read. So a thread cannot gather all three rows into shared memory
-// at once. Instead the block stages rows `y - 1` and `y`, takes the ky = 0 and
-// ky = 1 taps from them, then OVERWRITES the `y - 1` slot with row `y + 1` behind a
-// `__syncthreads` and takes the ky = 2 taps - reading the row through a clamped
-// index so that a tap at the top or bottom edge multiplies a row that is in fact
-// present (that is the conv's border rule; the multiplication is legal because the
-// tap's weight contribution is what is being dropped, not the value).
+// THE THREE SOURCE ROWS ARE STAGED IN THREE SHARED SLOTS, one row each, and the
+// missing one at either plane edge is written as ZEROS so its taps contribute
+// nothing. Output row `y` of the conv reads input rows `y - 1`, `y` and `y + 1`;
+// row `-1` and row `h` do not exist, and the conv's border rule is to skip those
+// taps. Clamping a missing row into a neighbour's slot instead - which is what an
+// earlier two-slot scheme did - is NOT the same computation: it counts the centre
+// row twice at the top edge. The caller has already reflect-padded the plane, so
+// the plane's own edges are what the conv's zero padding would be at the image
+// border, and the staging here needs no edge special case beyond the two skips.
 //
-// The row `y - 1` loaded at the top of a block is the REFLECTED padding of the
-// plane, not the conv's zero padding: the caller passes `x` as the padded input
-// plane (`lg_reflect_pad`'s output), so `x[-1] == x[1]` is already true and the
-// staging here needs no edge special case. That is the same convention
-// `lg_conv3x3s1p1` has, and the reason a mismatched pad would show up as a border
-// ring in the output rather than as a uniform shift.
+// Limits, checked by the caller: `blockDim.x` is `ceil(wd / 4)` (SS_SHS_COLS
+// columns per thread), so the block stays under the 1024 a block has for every
+// padded width this engine can plan (1080 at the largest image, i.e. 270 threads),
+// and the channel reduction is chunked by the caller so the three stage rows fit
+// the 48 KB a launch may take without the driver's opt-in. See `gpu.rs`.
 //
-// Limits, checked by the caller: `2 * wd <= 1024` (one output row per block) and
-// `c_in <= SS_SHS_CI`. The plan's padded width for the largest image this engine
-// can run is 1080, so the first is 2160 > 1024 - the head's LAST octave is run
-// row-blocked by the caller instead. See `gpu.rs`.
-// Columns per thread: four keeps the block at `ceil(wd / 4)` threads, under the
-// 1024 a block has, for every padded width this engine can plan (1080 at the
-// largest image, i.e. 270 threads).
+// COLUMNS PER THREAD: four. One thread per column needs `2 * wd <= 1024` and
+// refuses every pixel-shuffle checkpoint above a 480-pixel input. Four.
 #define SS_SHS_COLS 4
 
 extern "C" __global__ void ss_conv3x3_shuffle2(
@@ -438,15 +463,33 @@ extern "C" __global__ void ss_conv3x3_shuffle2(
             const float *src_a = in + ((size_t)ci * h + y) * wd;
             const float *src_b = in + ((size_t)ci * h + (y + 1 < h ? y + 1 : y)) * wd;
             const float *src_c = in + ((size_t)ci * h + (y > 0 ? y - 1 : 0)) * wd;
+            // ONE THREAD PER STAGED COLUMN, and that column's ONLY writer. Zeroing
+            // the whole row in one loop and then filling `x + 1` in a second loop
+            // puts two DIFFERENT threads' writes on the same shared address in an
+            // order nothing orders: the thread that owns column `x` filled it
+            // before the barrier, and the thread that owns `x + 1` may zero it
+            // before or after that fill. The `__syncthreads()` below orders the
+            // staging against the ACCUMULATION, not the staging against itself.
+            //
+            // THE BUG WAS INVISIBLE BELOW A WARP: with `blockDim.x <= 32` the block
+            // is one warp, whose lanes issue together, so the two loops interleave
+            // the same way every run and every width agreed to one level. The
+            // measured boundary is exactly there and nowhere else - `blockDim.x` is
+            // `ceil(wd / 4)`, so a plane up to 128 is one warp and agrees, and every
+            // plane above 128 (block >= 33) diverges. That is why the fixtures, which
+            // are 33 wide, never saw it, and why it showed up first as run-to-run
+            // non-determinism at image sizes.
             for (int x = tx; x < (int)row; x += blockDim.x) {
-                ar[x] = 0.0f;
-                br[x] = 0.0f;
-                cr[x] = 0.0f;
-            }
-            for (int x = tx; x < wd; x += blockDim.x) {
-                ar[x + 1] = src_a[x];
-                br[x + 1] = (y + 1 < h) ? src_b[x] : 0.0f;
-                cr[x + 1] = (y > 0) ? src_c[x] : 0.0f;
+                const int sx = x - 1;
+                if (sx >= 0 && sx < wd) {
+                    ar[x] = src_a[sx];
+                    br[x] = (y + 1 < h) ? src_b[sx] : 0.0f;
+                    cr[x] = (y > 0) ? src_c[sx] : 0.0f;
+                } else {
+                    ar[x] = 0.0f;
+                    br[x] = 0.0f;
+                    cr[x] = 0.0f;
+                }
             }
         }
         __syncthreads();

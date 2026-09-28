@@ -1,8 +1,8 @@
 [package]
 name = "swin2sr"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Fast, self-contained Swin2SR image restoration (classical and real-world super-resolution) with CPU and CUDA backends"
+description = "Fast, self-contained Swin2SR image restoration (classical, real-world, lightweight and compressed super-resolution) with CPU and CUDA backends"
 license = "MIT"
 repository = "https://github.com/jacobsparts/swin2sr-rs"
 readme = "README.md"
@@ -18,13 +18,6 @@ path = "src/main.rs"
 default = ["cuda"]
 # Compiles cuda/swin2sr.cu with nvcc and embeds the fatbins.
 cuda = []
-# DEVELOPMENT BUILDS ONLY. Adds --raw/--raw-out (run the network on a generated
-# plane of floats instead of an image) and --dump (write every intermediate
-# activation), which are how a divergence is located by STAGE rather than by
-# bisection on the final image. Neither is any use to someone who wants a
-# restored PNG, so a release binary neither accepts them nor lists them.
-#     cargo build --release --features dev
-dev = []
 
 [dependencies]
 png = "0.17"

@@ -5,8 +5,6 @@
 //!   swin2sr -m model.safetensors --verify tests/data/classical_x4.bin
 //!
 //! See README.md for the measured numbers behind `--tile` and `--device`.
-#[cfg(feature = "dev")]
-use std::io::Write;
 use std::time::Instant;
 
 use swin2sr::backend::{
@@ -17,14 +15,10 @@ use swin2sr::fixture::Fixture;
 #[cfg(feature = "cuda")]
 use swin2sr::gpu;
 use swin2sr::image;
-#[cfg(feature = "dev")]
-use swin2sr::plan::Plan;
 use swin2sr::weights::{Upsampler, Weights};
 
-/// The flags every build has. The `dev`-only ones are appended by [`usage`], so a
-/// release binary never advertises a flag it would reject.
 const USAGE: &str = "\
-swin2sr - Swin2SR image restoration (classical and real-world super-resolution)
+swin2sr - Swin2SR image restoration (super-resolution)
 
     swin2sr -m <weights.safetensors> -i <in.png> -o <out.png> [options]
 
@@ -42,6 +36,9 @@ swin2sr - Swin2SR image restoration (classical and real-world super-resolution)
                           worst difference against the reference and exit non-zero
                           if it exceeds --tol
         --tol <f>         tolerance for --verify (default 2e-3, see README)
+        --aux <path>      ALSO write the head's second output image, for the
+                          compressed_sr checkpoint (one pass only: it is produced
+                          at the padded plane, which tiling does not preserve)
     -q, --quiet           no progress output
         --cuda-selftest   compare each CUDA kernel against its CPU twin and exit
         --self-test       run the CPU library's internal checks and exit
@@ -49,25 +46,6 @@ swin2sr - Swin2SR image restoration (classical and real-world super-resolution)
         --info            print what this binary and this machine can do, and exit
     -h, --help            this text
     -V, --version         print the version";
-
-#[cfg(feature = "dev")]
-const USAGE_DEV: &str = "
-
-Development builds also accept:
-
-        --raw <h>x<w>     run the network on a generated plane of floats instead
-                          of an image, and write raw f32 out (no PNG round trip)
-        --raw-out <path>  where --raw writes its f32 result
-        --dump <path>     write every intermediate activation as a flat f32 file
-                          with a small index; compare with tools/compare.py";
-
-#[cfg(not(feature = "dev"))]
-const USAGE_DEV: &str = "";
-
-/// The whole help text: the flags this build has, then the ones it does not.
-fn usage() -> String {
-    format!("{USAGE}{USAGE_DEV}")
-}
 
 fn die(msg: &str) -> ! {
     eprintln!("error: {msg}");
@@ -77,7 +55,7 @@ fn die(msg: &str) -> ! {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        println!("{}", usage());
+        println!("{USAGE}");
         std::process::exit(0);
     }
     let mut model: Option<String> = None;
@@ -87,19 +65,13 @@ fn main() {
     let mut tile = 0usize;
     let mut tile_pad = 32usize;
     let mut verify: Option<String> = None;
+    let mut aux_out: Option<String> = None;
     let mut tol = 2e-3f32;
     let mut quiet = false;
     let mut selftest = false;
     let mut cuda_selftest = false;
     let mut list_weights = false;
     let mut info = false;
-    #[cfg(feature = "dev")]
-    let mut raw: Option<(usize, usize)> = None;
-    #[cfg(feature = "dev")]
-    let mut raw_out: Option<String> = None;
-    #[cfg(feature = "dev")]
-    let mut dump: Option<String> = None;
-
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -120,27 +92,15 @@ fn main() {
             }
             "--tile-pad" => tile_pad = val(&mut i).parse().unwrap_or_else(|_| die("--tile-pad takes a number")),
             "--verify" => verify = Some(val(&mut i)),
+            "--aux" => aux_out = Some(val(&mut i)),
             "--tol" => tol = val(&mut i).parse().unwrap_or_else(|_| die("--tol takes a number")),
             "-q" | "--quiet" => quiet = true,
             "--cuda-selftest" => cuda_selftest = true,
             "--self-test" => selftest = true,
             "--list-weights" => list_weights = true,
             "--info" => info = true,
-            #[cfg(feature = "dev")]
-            "--raw" => {
-                let v = val(&mut i);
-                let (h, w) = v.split_once('x').unwrap_or_else(|| die("--raw takes <h>x<w>"));
-                raw = Some((
-                    h.parse().unwrap_or_else(|_| die("--raw height")),
-                    w.parse().unwrap_or_else(|_| die("--raw width")),
-                ));
-            }
-            #[cfg(feature = "dev")]
-            "--raw-out" => raw_out = Some(val(&mut i)),
-            #[cfg(feature = "dev")]
-            "--dump" => dump = Some(val(&mut i)),
             "-h" | "--help" => {
-                println!("{}", usage());
+                println!("{USAGE}");
                 return;
             }
             "-V" | "--version" => {
@@ -214,14 +174,6 @@ fn main() {
     // ---------------------------------------------------------------------
     // The image path.
     // ---------------------------------------------------------------------
-    #[cfg(feature = "dev")]
-    {
-        // `run_raw` diverges (it prints and exits), so there is no fallthrough.
-        if let Some((h, w)) = raw {
-            run_raw(&wt, h, w, want_gpu, raw_out.as_deref(), dump.as_deref());
-        }
-    }
-
     let input = input.unwrap_or_else(|| "-".into());
     let img = match input.as_str() {
         "-" => {
@@ -241,6 +193,27 @@ fn main() {
         Ok(p) => p.plan,
         Err(e) => die(&e),
     };
+    // `--aux` asks for the head's second image, which exists only for a single
+    // pass and only for one head. Both facts are knowable HERE, before the image is
+    // read and before anything is allocated - so the refusals belong here rather
+    // than after a PNG has already been written, which is what a check at the end
+    // would do. (`--tile auto` can still fall back to a smaller tile; the write
+    // below keeps its own check for that case.)
+    if aux_out.is_some() {
+        if wt.upsampler != Upsampler::PixelShuffleAux {
+            die(&format!(
+                "--aux: the {} head has one output; only the compressed_sr head \
+                 (pixelshuffle_aux) produces a second image",
+                wt.upsampler.name()
+            ));
+        }
+        if tile != 0 {
+            die(&format!(
+                "--aux: the second image exists only for a single pass, and --tile {tile} would \
+                 compute it per tile. Use --tile 0 (the default)."
+            ));
+        }
+    }
     let budget = memory_budget(want_gpu, &wt);
     let tile = if tile == usize::MAX {
         auto_tile(&wt, budget, img.h, img.w, tile_pad, want_gpu)
@@ -332,6 +305,16 @@ fn main() {
         Err(e) => die(&e),
     };
     let dt = t0.elapsed();
+    #[cfg(feature = "cuda")]
+    if want_gpu {
+        // Only meaningful for the device backend, and a no-op without
+        // `SWIN2SR_PROFILE_GPU`; the sync is what makes the per-kernel event
+        // times comparable to `dt`, and it is a sync the process was about to
+        // earn anyway when it wrote the PNG.
+        if lightgpu::vm::sync().is_ok() {
+            swin2sr::cuda::Profile::report(dt.as_secs_f32() * 1e3);
+        }
+    }
     if !quiet {
         // The banner above named the tile the run WOULD have used; if the
         // fallback shrank it, say so here rather than leaving the two lines to
@@ -366,6 +349,43 @@ fn main() {
             if !quiet {
                 eprintln!("  wrote {path}");
             }
+        }
+    }
+
+    // The head's second image, when one was asked for. It lives on the PADDED
+    // plane and is only well defined for a single pass: a tiled run computes it
+    // per tile, and the last tile's plane is not the image's. So a tiled request is
+    // REFUSED rather than answered with something that looks like a thumbnail of
+    // the wrong region.
+    if let Some(path) = aux_out.as_deref() {
+        // The head and the requested tile were checked before the run; this is the
+        // one case that check cannot cover, `--tile auto` deciding after the fact
+        // that the whole image does not fit.
+        if ran != 0 {
+            die(&format!(
+                "--aux: the second image exists only for a single pass, and this run used a \
+                 {ran}x{ran} tile. Re-run with --tile 0 (or --tile auto on an image that fits)."
+            ));
+        }
+        let aux = backend
+            .aux()
+            .unwrap_or_else(|| die("--aux: the backend produced no second image"));
+        let (aw, ah) = (plan.wp, plan.hp);
+        if aux.len() != 3 * aw * ah {
+            die(&format!(
+                "--aux: expected {} values for a {aw}x{ah} plane, the backend produced {}",
+                3 * aw * ah,
+                aux.len()
+            ));
+        }
+        // The same quantisation the main image gets, at the aux plane's own size.
+        let img_aux = image::Image { w: aw, h: ah, data: aux.to_vec() };
+        let rgb_aux = img_aux.to_rgb8();
+        if let Err(e) = image::save_rgb(path, aw, ah, &rgb_aux) {
+            die(&e);
+        }
+        if !quiet {
+            eprintln!("  wrote {path} ({aw}x{ah} from the compressed head)");
         }
     }
 }
@@ -470,8 +490,6 @@ fn print_info() {
             Err(e) => println!("  device: unavailable ({e})"),
         }
     }
-    #[cfg(feature = "dev")]
-    println!("  dev features: --raw, --dump");
 }
 
 fn print_weights(w: &Weights) {
@@ -482,9 +500,6 @@ fn print_weights(w: &Weights) {
     );
     println!("img_range {} mean {:?}", w.img_range, w.mean);
     println!("{} tensors, {:.1} MiB", w.names.len(), w.bytes as f64 / (1024.0 * 1024.0));
-    if w.upsampler == Upsampler::PixelShuffleAux {
-        println!("note: the compressed_sr head is not implemented by this engine");
-    }
     for n in &w.names {
         println!("  {n}");
     }
@@ -656,127 +671,70 @@ fn verify_fixture(wt: &Weights, f: &Fixture, want_gpu: bool, tol: f32, quiet: bo
         );
     }
     println!("  max |diff| {worst:.6} at (x{x}, y{y}, c{c})  mean |diff| {mean:.8}  tol {tol:.1e}");
-    if worst <= tol {
+    let ok_main = worst <= tol;
+    if !ok_main {
+        println!("  FAIL - the reference and this engine disagree by more than the tolerance");
+        println!("  expected {:+.6}, got {:+.6}", f.expected[at], got[at]);
+    }
+    // The compressed head returns a SECOND image, and a fixture made from it
+    // carries a second plane. Both directions are errors worth reporting: a
+    // backend that produces one where the fixture has none is writing a file the
+    // reference never produced, and the reverse is a head that quietly dropped
+    // half its output.
+    let mut ok_aux = true;
+    match (f.aux.as_deref(), backend.aux()) {
+        (None, None) => {}
+        (Some(want), Some(aux_got)) => {
+            let (ah, aw) = f.aux_plane();
+            if aux_got.len() != want.len() {
+                println!("  aux: {} values, the fixture has {}", aux_got.len(), want.len());
+                ok_aux = false;
+            } else {
+                let mut aw_worst = 0.0f32;
+                let mut aw_at = 0usize;
+                let mut aw_mean = 0.0f64;
+                for (i, (a, b)) in want.iter().zip(aux_got).enumerate() {
+                    let d = (a - b).abs();
+                    aw_mean += d as f64;
+                    if d > aw_worst {
+                        aw_worst = d;
+                        aw_at = i;
+                    }
+                }
+                let aw_mean = (aw_mean / want.len() as f64) as f32;
+                // The aux plane is on the PADDED grid, so its index is a plane
+                // index and not the output pixel `locate` would give.
+                let plane = ah * aw;
+                println!(
+                    "  aux {aw}x{ah}: max |diff| {aw_worst:.6} at (x{}, y{}, c{})  mean |diff| {aw_mean:.8}",
+                    aw_at % aw,
+                    (aw_at % plane) / aw,
+                    aw_at / plane
+                );
+                ok_aux = aw_worst <= tol;
+                if !ok_aux {
+                    println!("  aux FAIL - expected {:+.6}, got {:+.6}", want[aw_at], aux_got[aw_at]);
+                }
+            }
+        }
+        (Some(want), None) => {
+            println!(
+                "  aux: the fixture has a {}x{} aux plane and this backend produced none",
+                f.aux_plane().1,
+                f.aux_plane().0
+            );
+            let _ = want;
+            ok_aux = false;
+        }
+        (None, Some(aux_got)) => {
+            println!("  aux: this backend produced {} values the fixture does not have", aux_got.len());
+            ok_aux = false;
+        }
+    }
+    if ok_main && ok_aux {
         println!("  PASS");
         0
     } else {
-        println!("  FAIL - the reference and this engine disagree by more than the tolerance");
-        println!(
-            "  expected {:+.6}, got {:+.6}",
-            f.expected[at], got[at]
-        );
         1
     }
-}
-
-/// The `dev`-only raw path: a generated input, written as f32 with no PNG round
-/// trip, plus an optional stage dump. Used by `tools/compare.py` and by
-/// `tests/parity.rs` for fixtures larger than a round trip should be.
-#[cfg(feature = "dev")]
-#[allow(clippy::too_many_arguments)]
-fn run_raw(
-    wt: &Weights,
-    h: usize,
-    w: usize,
-    want_gpu: bool,
-    raw_out: Option<&str>,
-    dump: Option<&str>,
-) -> ! {
-    let pre = match Pre::new(wt, h, w) {
-        Ok(p) => p,
-        Err(e) => die(&e),
-    };
-    // A deterministic input: the raw path exists to be replicated by the torch
-    // reference, so its input has to be reproducible from (h, w) alone.
-    let mut input = vec![0.0f32; 3 * h * w];
-    for (i, v) in input.iter_mut().enumerate() {
-        let t = (i as f32) * 0.6180339887;
-        *v = t - t.floor();
-    }
-    let adjusted = pre.adjust(wt, &input);
-    let mut backend = backend_for(want_gpu, wt);
-    let out = match backend.forward(h, w, &adjusted) {
-        Ok(o) => o,
-        Err(e) => die(&e),
-    };
-    let (oh, ow) = (h * wt.scale, w * wt.scale);
-    if let Some(path) = dump {
-        match write_dump(path, wt, &pre.plan, &input, &out) {
-            Ok(n) => println!("{path}: {n} arrays"),
-            Err(e) => die(&e),
-        }
-    }
-    match raw_out {
-        Some(path) => {
-            let mut f = std::fs::File::create(path).unwrap_or_else(|e| die(&format!("{path}: {e}")));
-            let mut head = Vec::new();
-            head.extend_from_slice(b"SW2R");
-            for v in [1u32, h as u32, w as u32, 3, wt.scale as u32, wt.window as u32] {
-                head.extend_from_slice(&v.to_le_bytes());
-            }
-            f.write_all(&head).unwrap_or_else(|e| die(&format!("{path}: {e}")));
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(out.as_ptr() as *const u8, out.len() * 4)
-            };
-            f.write_all(bytes).unwrap_or_else(|e| die(&format!("{path}: {e}")));
-            println!("{path}: {oh}x{ow}x3");
-        }
-        None => println!("{oh}x{ow}x3 {} f32", out.len()),
-    }
-    std::process::exit(0)
-}
-
-/// The dump: a flat f32 file with a JSON index next to it, so a stage can be
-/// compared without either side knowing the other's layout.
-#[cfg(feature = "dev")]
-fn write_dump(
-    path: &str,
-    wt: &Weights,
-    plan: &Plan,
-    input: &[f32],
-    expected: &[f32],
-) -> Result<usize, String> {
-    use swin2sr::cpu::Scratch;
-    let mut scr = Scratch::new(plan, wt.mlp_ratio);
-    let mut arrays: Vec<(String, usize, usize)> = Vec::new();
-    let mut blob: Vec<f32> = Vec::new();
-    let adjusted: Vec<f32> = input
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (v - wt.mean[i / (plan.h * plan.w)]) * wt.img_range)
-        .collect();
-    {
-        let mut sink = |name: &str, buf: &[f32], c: usize| {
-            arrays.push((name.to_string(), c, buf.len() / c.max(1)));
-            blob.extend_from_slice(buf);
-        };
-        // The result is discarded: what this needs is the arrays the sink collects
-        // on the way through.
-        swin2sr::cpu::forward(wt, plan, &adjusted, &mut scr, Some(&mut sink))?;
-    }
-    arrays.push(("output".into(), 3, expected.len() / 3));
-    blob.extend_from_slice(expected);
-
-    let mut idx = String::from("{\"geometry\":{");
-    idx.push_str(&format!(
-        "\"h\":{},\"w\":{},\"hp\":{},\"wp\":{},\"win\":{},\"c\":{},\"scale\":{}}},",
-        plan.h, plan.w, plan.hp, plan.wp, plan.win, plan.c, wt.scale
-    ));
-    idx.push_str("\"dt\":\"f32\",\"order\":[\n");
-    let mut off = 0usize;
-    for (i, (name, c, hw)) in arrays.iter().enumerate() {
-        idx.push_str(&format!(
-            "  {{\"name\":\"{name}\",\"c\":{c},\"hw\":{hw},\"offset\":{off},\"count\":{}}}{}\n",
-            c * hw,
-            if i + 1 == arrays.len() { "" } else { "," }
-        ));
-        off += c * hw;
-    }
-    idx.push_str("]}\n");
-    std::fs::write(path, unsafe {
-        std::slice::from_raw_parts(blob.as_ptr() as *const u8, blob.len() * 4)
-    })
-    .map_err(|e| format!("{path}: {e}"))?;
-    std::fs::write(format!("{path}.json"), idx).map_err(|e| format!("{path}.json: {e}"))?;
-    Ok(arrays.len())
 }

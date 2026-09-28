@@ -91,6 +91,10 @@ pub struct Gpu<'a> {
     zeros: DevBuf,
     acts: Option<Acts>,
     plan: Option<Plan>,
+    /// The last forward's secondary image, for a head that produces one. Held on
+    /// the handle rather than added to `Backend::forward`'s return, whose single
+    /// plane every existing caller depends on - the same choice the CPU backend made.
+    aux: Option<Vec<f32>>,
 }
 
 impl<'a> Gpu<'a> {
@@ -99,10 +103,25 @@ impl<'a> Gpu<'a> {
         let mut w = HashMap::new();
         for name in needed(wt) {
             let host = wt.t(&name);
-            w.insert(name, cuda.upload(host)?);
+            // `attn.cpb_pre` IS UPLOADED TRANSPOSED, to [head][query][key]. The
+            // kernel's inner loop reads one head's bias plane `n*n` times per query
+            // row, and the checkpoint's layout is [query][key][head] - so an
+            // untransposed read walks with a stride of `heads` floats and a warp
+            // touches 32 cache lines per key to use 6 of the 32 loaded values. The
+            // re-indexing is done ONCE here, at upload, where it costs nothing, and
+            // the kernel's arithmetic is untouched: same numbers, same order, same
+            // accumulation, so the device result is bit-identical to before.
+            // `tests/parity.rs`'s golden fixtures pin the whole-file result, so a
+            // wrong transpose cannot hide.
+            let host = if name.ends_with("attn.cpb_pre") {
+                transpose_cpb(host, wt.heads, wt.window * wt.window)
+            } else {
+                host.to_vec()
+            };
+            w.insert(name, cuda.upload(&host)?);
         }
         let zeros = cuda.buf(wt.embed.max(wt.window * wt.window))?;
-        Ok(Gpu { wt, cuda, w, zeros, acts: None, plan: None })
+        Ok(Gpu { wt, cuda, w, zeros, acts: None, plan: None, aux: None })
     }
 
     fn w(&self, name: &str) -> &DevBuf {
@@ -170,7 +189,12 @@ impl<'a> Gpu<'a> {
         a.ptr(inp.ptr).ptr(self.w(&format!("{name}.weight")).ptr)
             .ptr(self.w(&format!("{name}.bias")).ptr).ptr(out.ptr)
             .i32(ci as i32).i32(co as i32).i32(h as i32).i32(wd as i32);
-        self.cuda.run("lg_conv1x1", Launch::new(grid_for(co * h * wd, BLOCK), (BLOCK as u32, 1, 1)), &mut a)
+        // `lg_conv1x1_rb`: the same op, register-tiled 4x4, so one block covers a
+        // 64x64 patch of (pixel, channel) instead of 256 elements. Needed for the
+        // same reason as the linear above - the 1x1 path is 7% of a device run and
+        // its grid was `co * h * wd / 256`, i.e. one output element per thread.
+        let grid = (grid_for(h * wd, 64).0, grid_for(co, 64).0, 1);
+        self.cuda.run("lg_conv1x1_rb", Launch::new(grid, (16, 16, 1)), &mut a)
     }
 
     /// A [tokens][c] x [c][c] matmul with a named bias. `bias` is looked up under
@@ -198,8 +222,21 @@ impl<'a> Gpu<'a> {
         let mut a = Args::new();
         a.ptr(x.ptr).ptr(self.w(wname).ptr).ptr(bias).ptr(out.ptr + (out_off * 4) as u64)
             .i32(rows as i32).i32(ci as i32).i32(co as i32);
-        let grid = (grid_for(co, 16).0, grid_for(rows, 16).0, 1);
-        self.cuda.run("lg_linear", Launch::new(grid, (16, 16, 1)), &mut a)
+        // THE REGISTER-BLOCKED FORM. `lg_linear` gives one thread one output
+        // element, so its 16x16 block computes a 16x16 tile; `lg_linear_rb` gives
+        // one thread a 4x4 sub-tile, so the same 256 threads cover 64x64 outputs
+        // and each element of `x` staged into shared memory is reused 4 times
+        // more. The two are BIT-IDENTICAL (both accumulate `c` ascending and add
+        // the bias last), which is why the swap is safe to make on the strength of
+        // the shape alone, and `--cuda-selftest` checks `lg_linear` against
+        // `cpu::linear` on the same input as a second opinion.
+        //
+        // The qkv projection is the shape this is for: `rows` is 1156 tokens and
+        // `c_out` is 12, so the 16x16 grid it used to launch - (1, 73) blocks -
+        // was spending 16 threads of a 16x16 block per output row and running 73
+        // blocks where 19 do.
+        let grid = (grid_for(co, 64).0, grid_for(rows, 64).0, 1);
+        self.cuda.run("lg_linear_rb", Launch::new(grid, (16, 16, 1)), &mut a)
     }
 
     fn layer_norm(&self, x: &DevBuf, w: &str, b: &str, y: &DevBuf, c: usize, hw: usize) -> Result<(), String> {
@@ -324,14 +361,14 @@ impl<'a> Gpu<'a> {
     /// compares this launch against that function.
     ///
     /// THE KERNEL IS ROW-BLOCKED, NOT WINDOW-BLOCKED: one block is one output row,
-    /// with `blockDim.x == wd` so each thread writes both the even and the odd
-    /// column of its output row (the shuffle interleaves two conv channels). A
-    /// block also stages the three rows the conv reads - `y - 1`, `y` and `y + 1`,
-    /// one shared slot each, with the missing one at either edge written as ZEROS
-    /// so its taps contribute nothing. Clamping the missing row into a neighbour's
-    /// slot instead (which is what reusing one slot would do) is NOT the same
-    /// computation: it counts the centre row twice at the top edge, and that was
-    /// the first version of this kernel.
+    /// and each thread writes both the even and the odd column of its output row
+    /// (the shuffle interleaves two conv channels). A block also stages the three
+    /// rows the conv reads - `y - 1`, `y` and `y + 1`, one shared slot each, with
+    /// the missing one at either edge written as ZEROS so its taps contribute
+    /// nothing. Clamping the missing row into a neighbour's slot instead (which is
+    /// what reusing one slot would do) is NOT the same computation: it counts the
+    /// centre row twice at the top edge, and that was the first version of this
+    /// kernel.
     ///
     /// `blockDim.x` IS `ceil(wd / 4)` AND NOT `wd`: each thread carries four
     /// strided columns of accumulators (`SS_SHS_COLS` in the kernel), so the block
@@ -408,7 +445,10 @@ impl<'a> Gpu<'a> {
     /// image's own size. The padding is the first step here exactly as it is on
     /// the CPU side - both call `plan::pad_reflect`, so the two backends cannot
     /// disagree about the geometry the reference's padding produces.
-    fn forward_plan(&self, plan: &Plan, input: &[f32]) -> Result<Vec<f32>, String> {
+    /// Returns the restored image and, for a head that produces one, the secondary
+    /// `aux` image - already through `cpu::finish_aux`, exactly as on the CPU side.
+    fn forward_plan(&self, plan: &Plan, input: &[f32])
+        -> Result<(Vec<f32>, Option<Vec<f32>>), String> {
         let acts = self.acts.as_ref().expect("acts are built with the plan");
         let c = plan.c;
         let hw = plan.plane();
@@ -496,13 +536,48 @@ impl<'a> Gpu<'a> {
         // The head leaves its result on the device (the two shuffle heads) or in
         // host memory (the direct head's is a device buffer too - see `head`), so
         // the one download happens here and the epilogue is the CPU backend's.
-        let dev = self.head(plan, &acts)?;
+        // The compressed head's OTHER input, computed here because `padded` is here:
+        // a host bicubic resample to the PADDED output grid, uploaded, then one
+        // conv3x3 on the device. See the long note in the arm for why the resample
+        // is host arithmetic and why the geometry is the padded one.
+        let bicubic = if self.wt.upsampler == Upsampler::PixelShuffleAux {
+            let feat = self.wt.t("conv_bicubic.weight").len() / (3 * 9);
+            let (oh, ow) = (plan.hp * self.wt.scale, plan.wp * self.wt.scale);
+            let mut resized = vec![0.0f32; 3 * oh * ow];
+            cpu::bicubic_resize(&padded, 3, plan.hp, plan.wp, oh, ow, &mut resized);
+            let dres = self.cuda.upload(&resized)?;
+            let bic = self.cuda.buf(feat * oh * ow)?;
+            self.conv3x3(&dres, 3, oh, ow, "conv_bicubic", feat, &bic)?;
+            Some(bic)
+        } else {
+            None
+        };
+        let (dev, dev_aux) = self.head(plan, &acts, bicubic.as_ref())?;
         let mut planes = vec![0.0f32; dev.bytes / 4];
         dev.download(&mut planes)?;
-        Ok(cpu::finish(self.wt, plan, &planes))
+        // The aux gets its OWN epilogue - `x / img_range + mean`, and no crop, since
+        // it is emitted on the padded plane. That is `cpu::finish_aux`, the same
+        // function the CPU backend uses: the device produces the activations, the
+        // host applies the denormalisation, and there is one copy of it.
+        let aux = match &dev_aux {
+            Some(d) => {
+                let mut host = vec![0.0f32; d.bytes / 4];
+                d.download(&mut host)?;
+                Some(cpu::finish_aux(self.wt, plan, &host))
+            }
+            None => None,
+        };
+        Ok((cpu::finish(self.wt, plan, &planes, plan.wp * self.wt.scale), aux))
     }
 
-    fn head(&self, plan: &Plan, acts: &Acts) -> Result<DevBuf, String> {
+    /// The reconstruction head. Returns the main output and, for the compressed
+    /// head, the SECOND image it produces - both device buffers, downloaded by the
+    /// caller, which then runs the same host epilogue the CPU backend does.
+    /// `bicubic` is the compressed head's pre-upsample branch, already on the device
+    /// at `feat` channels over the padded output grid - computed by `forward_plan`,
+    /// which is where the padded input plane lives. `None` for every other head.
+    fn head(&self, plan: &Plan, acts: &Acts, bicubic: Option<&DevBuf>)
+        -> Result<(DevBuf, Option<DevBuf>), String> {
         let wt = self.wt;
         let c = plan.c;
         let hw = plan.plane();
@@ -532,7 +607,7 @@ impl<'a> Gpu<'a> {
                 }
                 let planes = self.cuda.buf(3 * h2 * w2)?;
                 self.conv3x3(&cur, cur_c, h2, w2, "conv_last", 3, &planes)?;
-                Ok(planes)
+                Ok((planes, None))
             }
             Upsampler::PixelShuffleDirect => {
                 let out_ch = 3 * scale * scale;
@@ -553,7 +628,7 @@ impl<'a> Gpu<'a> {
                 }
                 let planes = self.cuda.buf(3 * plan.hp * scale * plan.wp * scale)?;
                 self.pixel_shuffle2(&up, out_ch, plan.hp, plan.wp, &planes)?;
-                Ok(planes)
+                Ok((planes, None))
             }
             Upsampler::NearestConv => {
                 let feat = wt.t("conv_before_upsample.0.weight").len() / (c * 9);
@@ -581,14 +656,62 @@ impl<'a> Gpu<'a> {
                 self.lrelu(&hr, 0.2, feat * h2 * w2)?;
                 let planes = self.cuda.buf(3 * h2 * w2)?;
                 self.conv3x3(&hr, feat, h2, w2, "conv_last", 3, &planes)?;
-                Ok(planes)
+                Ok((planes, None))
             }
-            Upsampler::PixelShuffleAux => Err(
-                "the compressed_sr head (pixelshuffle_aux) is not implemented - the bicubic \
-                 pre-upsample branch and the second output image are not part of this engine's \
-                 graph. Use a classical_sr, real_sr or lightweight_sr checkpoint."
-                    .into(),
-            ),
+            // The compressed head: the classical one with a bicubic shortcut around it
+            // and a second output image. See `cpu.rs` for the same graph written as
+            // slices - the ops are in the same order, deliberately.
+            //
+            // THE BICUBIC RESAMPLE ITSELF RUNS ON THE HOST, and only its 3-channel
+            // result is uploaded. There is no device kernel for it and inventing one
+            // for a branch that reads three channels would cost more than it saves;
+            // `cpu::bicubic_resize` is the same function `tests/bicubic.rs` holds to
+            // torch to 7.8e-6, so the device runs the checked implementation rather
+            // than a second transcription of it. Everything downstream - both convs,
+            // the two octaves and the add - is on the device as usual.
+            Upsampler::PixelShuffleAux => {
+                let feat = wt.t("conv_bicubic.weight").len() / (3 * 9);
+                // The PADDED output grid: see the long note in `cpu.rs`. The
+                // reference's `H, W` are the dims of the plane it was HANDED, and the
+                // task wrapper hands it the padded one, so its own crop is a no-op
+                // and the octaves' `conv_last` runs at this size too.
+                let bic = bicubic.expect("the compressed head needs the bicubic branch - see forward_plan");
+
+                let a = self.cuda.buf(feat * hw)?;
+                self.conv3x3(&acts.cur, c, plan.hp, plan.wp, "conv_before_upsample.0", feat, &a)?;
+                // 0.01, the `nn.LeakyReLU` default - not the 0.2 the real-world head's
+                // convs use. The two heads differ here and both slopes are in the
+                // reference.
+                self.lrelu(&a, 0.01, feat * hw)?;
+                // The SECOND output, off the padded plane: three channels, and the
+                // only tensor the aux branch reads.
+                let aux = self.cuda.buf(3 * hw)?;
+                self.conv3x3(&a, feat, plan.hp, plan.wp, "conv_aux", 3, &aux)?;
+
+                let x = self.cuda.buf(feat * hw)?;
+                self.conv3x3(&aux, 3, plan.hp, plan.wp, "conv_after_aux.0", feat, &x)?;
+                self.lrelu(&x, 0.01, feat * hw)?;
+
+                let (mut h2, mut w2) = (plan.hp, plan.wp);
+                let mut cur = x;
+                let cur_c = feat;
+                for o in 0..wt.upsampler.octaves(scale) {
+                    let shuf = self.cuda.buf(cur_c * 4 * h2 * w2)?;
+                    self.conv3x3_shuffle2(&cur, cur_c, h2, w2, &format!("upsample.{}", 2 * o),
+                                          cur_c, &shuf)?;
+                    cur = shuf;
+                    h2 *= 2;
+                    w2 *= 2;
+                }
+                // `x = upsample(x) + bicubic`, elementwise over the whole padded
+                // grid. `lg_add` is `dst += src` in place, and `cur` is not read
+                // again, so the sum lands in the octave buffer - the same thing
+                // `cpu.rs` does into `summed`.
+                self.add_into(bic, &cur, feat * h2 * w2)?;
+                let planes = self.cuda.buf(3 * h2 * w2)?;
+                self.conv3x3(&cur, cur_c, h2, w2, "conv_last", 3, &planes)?;
+                Ok((planes, Some(aux)))
+            }
         }
     }
 }
@@ -608,9 +731,14 @@ impl Backend for Gpu<'_> {
                 p
             }
         };
-        self.forward_plan(&plan, input)
+        let (planes, aux) = self.forward_plan(&plan, input)?;
+        self.aux = aux;
+        Ok(planes)
     }
 
+    fn aux(&self) -> Option<&[f32]> {
+        self.aux.as_deref()
+    }
 }
 
 /// The checkpoint tensors the graph launches against, derived from the
@@ -625,6 +753,25 @@ impl Backend for Gpu<'_> {
 /// the tensors are worth, not what the allocator rounds them to. A caller sizing
 /// a job wants the tensors; only a caller sizing an allocation wants the cube,
 /// and that is a fact about `Cuda`, not about the checkpoint.
+/// `[query][key][head]` -> `[head][query][key]`, for the attention bias table.
+///
+/// `cpu::attention` documents and does this same transpose, per call; on the device
+/// it is done ONCE at upload, because the table is a weight and rereading it in the
+/// checkpoint's layout costs a stride-`heads` gather in the kernel's innermost loop.
+/// A pure re-indexing: the same numbers, in the same order, with the same
+/// accumulation, so the device result is bit-identical to the untransposed read.
+pub fn transpose_cpb(src: &[f32], heads: usize, n: usize) -> Vec<f32> {
+    let mut dst = vec![0.0f32; heads * n * n];
+    for q in 0..n {
+        for k in 0..n {
+            for h in 0..heads {
+                dst[(h * n + q) * n + k] = src[(q * n + k) * heads + h];
+            }
+        }
+    }
+    dst
+}
+
 pub fn uploaded_bytes(wt: &Weights) -> u64 {
     let mut total = 0u64;
     for name in needed(wt) {
@@ -1023,13 +1170,15 @@ pub fn selftest(wt: &Weights) -> Result<(), String> {
             // One learned temperature per head, as the checkpoint's table is.
             let ls: Vec<f32> = (0..heads).map(|h| 1.3 - 0.2 * h as f32).collect();
             let cpb = seq(plan.n * plan.n * heads, 0.05);
+            // The kernel reads the transposed layout, as the graph's upload provides.
+            let cpbt = transpose_cpb(&cpb, heads, plan.n);
             let mut want = vec![0.0f32; plan.nw * plan.n * c];
             cpu::attention(&plan, heads, head_dim, &ls, &cpb, &qkv, shift, &mut want);
 
             let dqkv = cuda.upload(&qkv)?;
             let dout = cuda.buf(want.len())?;
             let mut a = Args::new();
-            a.ptr(dqkv.ptr).ptr(cuda.upload(&ls)?.ptr).ptr(cuda.upload(&cpb)?.ptr).ptr(dout.ptr)
+            a.ptr(dqkv.ptr).ptr(cuda.upload(&ls)?.ptr).ptr(cuda.upload(&cpbt)?.ptr).ptr(dout.ptr)
                 .i32(plan.nw as i32).i32(plan.n as i32).i32(plan.nww as i32).i32(plan.win as i32)
                 .i32(plan.hp as i32).i32(plan.wp as i32)
                 .i32(heads as i32).i32(head_dim as i32).i32(shift as i32);

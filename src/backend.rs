@@ -33,6 +33,19 @@ pub trait Backend {
     /// mean-adjusted); the result is [3][h*scale][w*scale] in [0,1] after the
     /// denormalisation.
     fn forward(&mut self, h: usize, w: usize, input: &[f32]) -> Result<Vec<f32>, String>;
+
+    /// The secondary image the last `forward` produced, if its head makes one.
+    ///
+    /// Only the compressed_sr head does: it returns the low-resolution
+    /// reconstruction beside the upsampled one, on the PADDED plane's geometry.
+    /// This is a separate accessor rather than a second element of `forward`'s
+    /// return so that every existing caller - and the tiled path, which calls
+    /// `forward` once per tile - keeps the signature it was written against.
+    /// `None` for every other head, which is what tells the caller not to write
+    /// a second file.
+    fn aux(&self) -> Option<&[f32]> {
+        None
+    }
 }
 
 /// The reference's preprocessing: pad to the next window multiple, subtract the
