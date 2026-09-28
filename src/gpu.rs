@@ -418,12 +418,24 @@ impl<'a> Gpu<'a> {
         )
     }
 
+    /// Depth-to-space, `F.pixel_shuffle(x, 2)`: the toolkit's `lg_pixel_shuffle`.
+    ///
+    /// This was the project kernel `ss_pixel_shuffle2` - a FLAT grid with a runtime
+    /// divide by 4 - until the forward direction was promoted into the toolkit
+    /// (which had only its inverse, `lg_pixel_unshuffle2`, and which is why this
+    /// head refused any scale but 2). The promotion ties the fixed-2 kernels of
+    /// nafnet-rs and this engine exactly and is 1.8-2.1x the flat-grid form that
+    /// hat-rs used to carry, so THE GRID IS PART OF THE CALL: 32x8 with the output
+    /// channel in `blockIdx.z`, which is a launch shape a flat `grid_for(total)`
+    /// would get wrong.
     fn pixel_shuffle2(&self, inp: &DevBuf, c4: usize, h: usize, wd: usize, out: &DevBuf) -> Result<(), String> {
+        let c = c4 / 4;
+        let (oh, ow) = (h * 2, wd * 2);
         let mut a = Args::new();
-        a.ptr(inp.ptr).ptr(out.ptr).i32(c4 as i32).i32(h as i32).i32(wd as i32);
-        let total = (c4 / 4) * (h * 2) * (wd * 2);
+        a.ptr(inp.ptr).ptr(out.ptr).i32(c as i32).i32(h as i32).i32(wd as i32).i32(2);
+        let grid = (ow.div_ceil(32) as u32, oh.div_ceil(8) as u32, c as u32);
         self.cuda
-            .run("ss_pixel_shuffle2", Launch::new(grid_for(total, BLOCK), (BLOCK as u32, 1, 1)), &mut a)
+            .run("lg_pixel_shuffle", Launch::new(grid, (32, 8, 1)), &mut a)
     }
 
     /// The toolkit's `lg_upsample2x_nearest`, which is the same op this file used
@@ -613,17 +625,22 @@ impl<'a> Gpu<'a> {
                 let out_ch = 3 * scale * scale;
                 let up = self.cuda.buf(out_ch * hw)?;
                 self.conv3x3(&acts.cur, c, plan.hp, plan.wp, "upsample.0", out_ch, &up)?;
-                // The one-step head's shuffle is scale x scale. For scale 2 that
-                // IS `ss_pixel_shuffle2` - the kernel's channel block is
-                // `ch*4 + dy*2 + dx`, which is the same sub-channel order torch's
-                // depth-to-space uses at r = 2. Larger scales would need a second
-                // kernel, and no released checkpoint of this head is above x2, so
-                // they are refused rather than quietly run through the host.
+                // The one-step head's shuffle is scale x scale, and the kernel
+                // behind it - the toolkit's `lg_pixel_shuffle` - takes the factor
+                // as a RUNTIME argument, so the device could run any of them. The
+                // guard stays because the FACTOR IS NOT WHAT IS UNVERIFIED: the
+                // head's own plan, its `3*scale*scale` conv and its output geometry
+                // have only ever been exercised at 2, and forwarding a differently
+                // shaped plane into the png writer is what a silent wrong answer
+                // would look like. The CPU backend's `pixel_shuffle` is general, so
+                // this is a limit of SCOPE rather than of kernels - lifting it is
+                // `c = out_ch / (scale * scale)` below once a checkpoint needs it.
                 if scale != 2 {
                     return Err(format!(
-                        "the pixelshuffledirect head at scale {scale} is not implemented on the \
-                         device: its shuffle kernel is written for r = 2 (the released \
-                         lightweight checkpoint is x2)"
+                        "the pixelshuffledirect head at scale {scale} is not verified on the \
+                         device: the op itself is general (lg_pixel_shuffle takes r), but this \
+                         head has only ever been run at 2, and the released lightweight \
+                         checkpoint is x2"
                     ));
                 }
                 let planes = self.cuda.buf(3 * plan.hp * scale * plan.wp * scale)?;
@@ -1056,7 +1073,10 @@ pub fn selftest(wt: &Weights) -> Result<(), String> {
     }
 
     {
-        // ss_pixel_shuffle2 and lg_upsample2x_nearest against their cpu twins.
+        // The head's pixel shuffle - the toolkit's `lg_pixel_shuffle` since the
+        // forward direction was promoted - and lg_upsample2x_nearest, against their
+        // cpu twins. Shapes chosen OFF the 32x8 tile (5x6 rows and columns) so the
+        // tail guards and the channel-in-blockIdx.z grid are both exercised.
         let (c4, h, w) = (8usize, 5usize, 6usize);
         let x = seq(c4 * h * w, 0.5);
         let mut want = vec![0.0f32; (c4 / 4) * 4 * h * w];
@@ -1064,11 +1084,13 @@ pub fn selftest(wt: &Weights) -> Result<(), String> {
         let dx = cuda.upload(&x)?;
         let dy = cuda.buf(want.len())?;
         let mut a = Args::new();
-        a.ptr(dx.ptr).ptr(dy.ptr).i32(c4 as i32).i32(h as i32).i32(w as i32);
-        cuda.run("ss_pixel_shuffle2", Launch::new(grid_for(want.len(), BLOCK), (BLOCK as u32, 1, 1)), &mut a)?;
+        let (c, oh, ow) = (c4 / 4, h * 2, w * 2);
+        a.ptr(dx.ptr).ptr(dy.ptr).i32(c as i32).i32(h as i32).i32(w as i32).i32(2);
+        let grid = (ow.div_ceil(32) as u32, oh.div_ceil(8) as u32, c as u32);
+        cuda.run("lg_pixel_shuffle", Launch::new(grid, (32, 8, 1)), &mut a)?;
         let mut got = vec![0.0f32; want.len()];
         dy.download(&mut got)?;
-        close("ss_pixel_shuffle2", &want, &got, tol)?;
+        close("lg_pixel_shuffle (the head's shuffle)", &want, &got, tol)?;
         checks += 1;
 
         let c = 4usize;

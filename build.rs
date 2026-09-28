@@ -54,6 +54,12 @@ const TOOLKIT_KERNELS: &[&str] = &[
     // The reconstruction head's activations.
     "lg_lrelu",
     "lg_copy",
+    // The reconstruction head's depth-to-space. This engine used to carry its own
+    // `ss_pixel_shuffle2`, and the head REFUSED a scale other than 2 for want of a
+    // general kernel; the promotion's `r` is a runtime argument, so the limit was
+    // the duplicate rather than the op. Interleaved A/B against this engine's copy:
+    // bit-identical output, 1.000 on time.
+    "lg_pixel_shuffle",
 ];
 
 /// This engine's own kernels, in `cuda/swin2sr.cu`.
@@ -67,7 +73,6 @@ const PROJECT_KERNELS: &[&str] = &[
     "ss_window_gather",
     "ss_window_scatter",
     "ss_attention",
-    "ss_pixel_shuffle2",
     "ss_conv3x3_shuffle2",
 ];
 

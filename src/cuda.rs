@@ -55,13 +55,12 @@ pub const TOOLKIT_KERNELS: &[&str] = &[
     "lg_copy",
 ];
 
-/// This engine's own kernels, from `cuda/swin2sr.cu`. The same four names
-/// `build.rs` validates against the source, in both directions.
+/// This engine's own kernels, from `cuda/swin2sr.cu`. The same names `build.rs`
+/// validates against the source, in both directions.
 pub const PROJECT_KERNELS: &[&str] = &[
     "ss_window_gather",
     "ss_window_scatter",
     "ss_attention",
-    "ss_pixel_shuffle2",
     "ss_conv3x3_shuffle2",
 ];
 

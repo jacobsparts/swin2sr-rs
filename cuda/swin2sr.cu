@@ -4,9 +4,16 @@
 // is one another model family could call unchanged. What is here is what the
 // window-versus-image duality forces onto the consumer: the two window index maps
 // that depend on this model's shift schedule, the attention kernel whose per-window
-// tables and shift mask the converter writes, and the pixel-shuffle of the head -
-// the toolkit has the INVERSE of that one (`lg_pixel_unshuffle2`) and no forward
-// form.
+// tables and shift mask the converter writes, and the FUSED 3x3-plus-shuffle of the
+// head's last octave, which is a fusion rather than an op.
+//
+// THE HEAD'S PLAIN PIXEL SHUFFLE IS NO LONGER ONE OF THEM. It was
+// `ss_pixel_shuffle2`, and it duplicated what two other engines had written
+// privately - and the toolkit's CONVENTIONS.md already recorded the inversion
+// (`lg_pixel_unshuffle2` with no forward form) as a gap rather than a rule. It is
+// now the toolkit's `lg_pixel_shuffle`, whose `r` is a runtime argument; that the
+// head used to REFUSE any scale but 2 was a consequence of the duplicate, not of
+// the model. Verified bit-identical against this engine's copy before removal.
 //
 // EVERYTHING ELSE IS THE TOOLKIT'S, AND THAT IS A CHANGE. This file used to carry
 // `ss_conv3x3`, `ss_linear`, `ss_conv1x1` and `ss_upsample2x_nearest` as well, and
@@ -313,34 +320,6 @@ extern "C" __global__ void ss_attention(
             orow[d] = ((a0 + a1) + (a2 + a3) + tail) * inv_sum;
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// The reconstruction head's resampling.
-// ---------------------------------------------------------------------------
-
-// `F.pixel_shuffle(x, 2)`: [4C][H][W] -> [C][2H][2W]. The toolkit's
-// `lg_pixel_unshuffle2` is the inverse of this and takes the same channel
-// permutation, so a forward form could arguably be promoted next to it; until it
-// is, this is the head's own (nafnet-rs keeps its own `nf_pixel_shuffle2` too).
-//
-// The upsampling the other heads need is NOT here: `nearest` is the toolkit's
-// `lg_upsample2x_nearest`, and the direct and aux heads have no resampling at all.
-extern "C" __global__ void ss_pixel_shuffle2(
-    const float *__restrict__ in, float *__restrict__ out, int c4, int h, int wd)
-{
-    const int c = c4 / 4;
-    const int oh = h * 2, ow = wd * 2;
-    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    const long total = (long)c * oh * ow;
-    if (idx >= total) return;
-    const int x = (int)(idx % ow);
-    const long t = idx / ow;
-    const int y = (int)(t % oh);
-    const int ch = (int)(t / oh);
-    const int dy = y & 1, dx = x & 1;
-    const int sub = ch * 4 + dy * 2 + dx;
-    out[idx] = in[((size_t)sub * h + (y >> 1)) * wd + (x >> 1)];
 }
 
 
