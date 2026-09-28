@@ -12,8 +12,10 @@ One of the [lightgpu inference engines](https://github.com/jacobsparts/lightgpu)
 pixeldeck, the family's local web app, drives this and the others.
 
 * Both backends in one executable: a pure-Rust CPU path and a CUDA path with
-  hand-written kernels. `--device cpu|gpu` picks one, and there is no silent
-  fallback - a GPU run that cannot start says so.
+  hand-written kernels. `--device cpu|gpu` picks one by hand; left to itself the
+  binary uses the GPU when a driver is there and the CPU when it is not, saying
+  which on stderr. Asking for `--device gpu` on a machine with no driver is an
+  error rather than a quiet change of plans.
 * Five checkpoints, converted from the official `.pth` files: classical x2 and
   x4, real-world x4, lightweight x2, and compressed x4. See
   [Choosing a checkpoint](#choosing-a-checkpoint).
@@ -68,7 +70,7 @@ swin2sr -m swin2sr-compressed-x4.safetensors -i in.png -o out.png --aux preview.
 | `-m, --model <path>` | converted `.safetensors` checkpoint (required) |
 | `-i, --input <path>` | input PNG, or `-` (default: stdin) |
 | `-o, --output <path>` | output PNG, or `-` (default: stdout) |
-| `--device cpu\|gpu` | which backend to use (default: gpu when built with the `cuda` feature, else cpu) |
+| `--device cpu\|gpu` | which backend to use. The default is the GPU when the binary has CUDA *and* a driver answers, otherwise the CPU, and it says on stderr when it falls back; naming `gpu` yourself is an error rather than a fallback |
 | `--tile <n\|auto>` | process in tiles of n pixels a side; `0` (default) is one whole-image pass |
 | `--tile-pad <n>` | context kept around each tile (default 32, rounded up to a window) |
 | `--aux <path>` | `compressed-x4` only: also write the head's second, low-resolution image |

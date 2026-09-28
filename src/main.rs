@@ -26,7 +26,7 @@ swin2sr - Swin2SR image restoration (super-resolution)
     -i, --input <path>    input PNG, or - for stdin (default: stdin)
     -o, --output <path>   output PNG, or - for stdout (default: stdout)
         --device <dev>    cpu or gpu (default: gpu when built with the `cuda`
-                          feature, else cpu)
+                          feature and a driver is there, else cpu)
         --tile <n>        process in tiles of n pixels a side; 0 (default) is one
                           pass, which is the only exact mode; `auto` picks the
                           largest window-aligned tile that fits the budget
@@ -138,14 +138,42 @@ fn main() {
     }
 
     // The device choice: explicit, or the best available.
-    let want_gpu = match device.as_deref() {
-        Some("gpu") => true,
-        Some("cpu") => false,
+    let asked = match device.as_deref() {
+        Some("gpu") => Some(true),
+        Some("cpu") => Some(false),
         Some(other) => die(&format!("--device takes cpu or gpu, not `{other}`")),
-        None => cfg!(feature = "cuda"),
+        None => None,
     };
-    if want_gpu && !cfg!(feature = "cuda") {
+    if asked == Some(true) && !cfg!(feature = "cuda") {
         die("this binary was built without the `cuda` feature; use --device cpu");
+    }
+    // THE DEFAULT DEVICE FALLS BACK, THE EXPLICIT ONE DOES NOT.
+    //
+    // Every engine in this family has to run on a machine with no CUDA driver -
+    // a laptop, a container without `--gpus`, a card whose driver did not load -
+    // and "the GPU is the default" must not mean "the engine is dead there". So
+    // the default probes ONCE, before the banner, before the tile is chosen and
+    // before anything is allocated, and a probe that fails makes this a CPU run.
+    //
+    // `--device gpu` typed by hand is a different request and stays fatal: the
+    // user named the device, and a run that quietly went to the CPU would take
+    // minutes where they expected seconds, with nothing to say why. That is the
+    // failure this engine's original design was protecting against, and it is
+    // still protected - it is just no longer the default's behaviour.
+    //
+    // The note is printed even under `-q`, like the `--tile 0` fallback: `-q`
+    // silences progress, not a change in what the run IS.
+    let mut want_gpu = asked.unwrap_or(cfg!(feature = "cuda"));
+    if want_gpu && asked.is_none() {
+        #[cfg(feature = "cuda")]
+        if let Err(e) = lightgpu::vm::device() {
+            want_gpu = false;
+            eprintln!(
+                "note: no usable CUDA device ({}) - running on the CPU. Pass --device gpu to \
+                 make this an error instead.",
+                e
+            );
+        }
     }
 
     if cuda_selftest {
